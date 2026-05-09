@@ -36,7 +36,7 @@ Run these on an interactive GPU node (`salloc -N1 -C gpu --gpus=1 -A m4267_g --q
 cd ~/amgx-sa
 export LD_LIBRARY_PATH=~/amgx-sa/build_perlmutter:$LD_LIBRARY_PATH
 
-# SA + Chebyshev smoother (best convergence)
+# SA + Chebyshev(1)+Jacobi smoother (matches PETSc GAMG default)
 ./build_perlmutter/test_sa_phase1 -m 100 -n 100 -c src/configs/AGGREGATION_SA_CHEBY.json
 
 # SA + Jacobi smoother
@@ -57,18 +57,31 @@ Number of Levels: 4
 
 4 levels expected: 10000 → ~1411 → ~185 → ~26 (coarsest < 25 = 5^D, D=2).
 
-### Reference: PETSc GAMG (local, no GPU)
+Also look for `[Chebyshev]` lines showing eigenvalue estimates per level:
+```
+[Chebyshev] level=10000  lambda_mode=4  lmax=...  lmin=...  lmin_denom=10  sa_eig_set=1
+[Chebyshev] level=1411   lambda_mode=4  lmax=...  lmin=...  lmin_denom=10  sa_eig_set=1
+```
+`sa_eig_set=1` confirms the SA rho was passed to the smoother.
+
+### Reference: PETSc GAMG (200×200, aggressive_coarsening=1)
 
 ```bash
 # On local machine (PETSC_ARCH=arch-macosx-gnu-O):
 cd ~/Codes/petsc/src/ksp/ksp/tutorials
-./ex2 -m 100 -n 100 -ksp_type richardson -pc_type gamg \
-      -pc_gamg_aggressive_coarsening 0 \
+./ex2 -m 200 -n 200 -ksp_type richardson -pc_type gamg \
+      -pc_gamg_aggressive_coarsening 1 \
+      -mg_levels_ksp_type chebyshev \
+      -mg_levels_ksp_chebyshev_esteig 0,0.1,0,1.1 \
+      -mg_levels_pc_type jacobi \
+      -mg_levels_ksp_max_it 1 \
       -ksp_monitor -ksp_view
 ```
 
-PETSc GAMG reference: 4 levels (10000→3683→519→38), ~11 iterations,
-asymptotic rate ~0.31.
+PETSc GAMG reference (200×200, aggressive_coarsening=1, Chebyshev(1)+Jacobi):
+- 5 levels: 40000 → 5602 → 976 → 98 → 9
+- λ_max per level: ~1.974, ~1.436, ~1.634, ~1.649
+- 21 iterations to convergence
 
 ### Convergence rate check
 
@@ -103,8 +116,11 @@ Test matrix: `build_perlmutter/poisson2d_amgx.mtx` (100×100 2D Poisson)
 | `src/aggregation/near_null_space.cu` | Near-null space storage and propagation |
 | `include/aggregation/batched_qr.h` | Header for batched QR |
 | `include/aggregation/near_null_space.h` | Header for near-null space |
+| `include/solvers/cheb_solver.h` | Chebyshev solver header; `setSAEigenvalue()` method |
+| `src/solvers/cheb_solver.cu` | Chebyshev solver; `lambda_mode=4`; `chebyshev_lmin_denom` config param |
+| `src/core.cu` | Config parameter registration |
 | `src/configs/AGGREGATION_SA_JACOBI.json` | SA config: Jacobi smoother, min_coarse_rows=25 |
-| `src/configs/AGGREGATION_SA_CHEBY.json` | SA config: Chebyshev smoother, min_coarse_rows=25 |
+| `src/configs/AGGREGATION_SA_CHEBY.json` | SA config: Chebyshev(1)+Jacobi, lambda_mode=4, lmin_denom=10 |
 
 ### SA Path in `createCoarseMatrices()`
 
@@ -123,6 +139,14 @@ The SA path is gated by `m_null_dim > 0` (near-null space set) and
    computes `P_smooth = S * P_tent` via SpGEMM
    (`CSR_Multiply::csr_multiply`). Damping factor `ω = 1.4 / ρ(D⁻¹A)`
    estimated by power iteration in `estimateSADampingFactor()`.
+   - **block_size == 1**: S has same sparsity as A (scalar CSR).
+   - **block_size > 1**: A is expanded from block-CSR to scalar CSR using
+     `build_SA_smoother_block_rowlen_kernel` + `build_SA_smoother_block_kernel`.
+     Each block-row i → block_size scalar rows; each block-nz → block_size²
+     scalar entries.
+   - After `smoothProlongator()`, `m_sa_rho = 1.4 / omega` is stored on the
+     level and passed to the Chebyshev smoother via `setSAEigenvalue(m_sa_rho)`
+     before `setup_smoother()` is called.
 
 4. **Galerkin product** — `Ac = P^T A P` via
    `CSR_Multiply::csr_galerkin_product`.
@@ -132,12 +156,32 @@ The SA path is gated by `m_null_dim > 0` (near-null space set) and
    `next_agg->setNearNullSpace(m_null_dim, coarse_dofs, ...)`. This enables
    SA on all coarse levels.
 
+### Chebyshev Smoother Eigenvalue Modes
+
+`chebyshev_lambda_estimate_mode` (config, default 0):
+- **0**: eigensolver for both lmin and lmax
+- **1**: eigensolver for lmax; lmin = lmax / lmin_denom
+- **2**: row-sum estimate for lmax; lmin = lmax / lmin_denom
+- **3**: user-provided `cheby_max_lambda` / `cheby_min_lambda`
+- **4**: reuse SA-computed `rho(D⁻¹A)` from `estimateSADampingFactor()`;
+  lmax = rho × 1.1; lmin = lmax / lmin_denom. Avoids a second power
+  iteration. Matches PETSc GAMG `-pc_gamg_use_sa_esteig`.
+
+`chebyshev_lmin_denom` (config, default 10.0):
+- lmin = lmax / lmin_denom
+- PETSc GAMG uses 10.0 (transform [0,0.1;0,1.1])
+- For D-dimensional problems: D³ (8 for 2D, 27 for 3D) is another option
+
 ### `[SA-VIEW]` Diagnostics
 
 Two permanent (non-debug) printfs in `aggregation_amg_level.cu`:
 
 1. After Galerkin product — prints per-level `#eqs` and `avg_nnz/row`
 2. In `estimateSADampingFactor()` — prints `rho(D^{-1}A)` and `omega`
+
+`[Chebyshev]` printf in `cheb_solver.cu` `solver_setup()`:
+- Prints `level=#rows lambda_mode lmax lmin lmin_denom sa_eig_set`
+- `sa_eig_set=1` confirms the SA rho was passed via `setSAEigenvalue()`
 
 ### Coarsening Control
 
@@ -170,7 +214,9 @@ With SIZE_8 selector (~7× coarsening ratio per level):
 
 ## Remaining Work
 
-- [ ] Verify 4-level hierarchy with min_coarse_rows=25
+- [ ] Build on Perlmutter and test 4-level hierarchy (min_coarse_rows=25, SIZE_8 selector, 100×100)
+- [ ] Verify `[Chebyshev] sa_eig_set=1` at each level with lambda_mode=4
+- [ ] Compare convergence rate vs PETSc GAMG reference (200×200, 5 levels, 21 iters)
 - [ ] Test with SIZE_4 selector
-- [ ] Block-size > 1 support in `smoothProlongator()`
+- [ ] Test block_size > 1 (elasticity problem)
 - [ ] Adaptive SA (multiple near-null vectors via randomized eigenvectors)
