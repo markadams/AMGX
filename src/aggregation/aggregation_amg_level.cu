@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <aggregation/aggregation_amg_level.h>
+#include <aggregation/batched_qr.h>
 #include <matrix_analysis.h>
 
 #ifdef _WIN32
@@ -19,6 +20,7 @@
 #include <cutil.h>
 #include <multiply.h>
 #include <transpose.h>
+#include <csr_multiply.h>
 #include <blas.h>
 #include <string>
 #include <string.h>
@@ -47,6 +49,32 @@ namespace aggregation
 // ----------------------
 // Kernels
 // ----------------------
+
+// Reshape R factors from per-aggregate column-major layout to global column-major B_c layout.
+// R_out layout: R_out[a * nd*nd + col*nd + row] (column-major nd×nd per aggregate)
+// B_coarse layout: B_coarse[k * num_aggs*nd + a*nd + j] (global column-major)
+// where k = null vector index, a = aggregate, j = local DOF within aggregate
+template <typename ValueType>
+__global__
+void reshape_R_to_coarse_B_kernel(
+    int num_aggs,
+    int null_dim,
+    const ValueType * __restrict__ R_out,     // [num_aggs * nd * nd], per-agg column-major
+    ValueType * __restrict__ B_coarse)         // [num_aggs * nd * nd], global column-major
+{
+    int total = num_aggs * null_dim * null_dim;
+    for (int idx = blockDim.x * blockIdx.x + threadIdx.x; idx < total; idx += gridDim.x * blockDim.x)
+    {
+        // Decode: which coarse DOF and which null vector?
+        int k = idx / (num_aggs * null_dim);   // null vector index
+        int c = idx % (num_aggs * null_dim);   // coarse DOF index
+        int a = c / null_dim;                   // aggregate
+        int j = c % null_dim;                   // local DOF within aggregate
+
+        // R_out index: a * nd*nd + k*nd + j (column-major within aggregate)
+        B_coarse[idx] = R_out[a * null_dim * null_dim + k * null_dim + j];
+    }
+}
 
 template <typename IndexType, typename ValueType>
 __global__
@@ -844,8 +872,18 @@ void Aggregation_AMG_Level_Base<T_Config >::prolongateAndApplyCorrection(VVector
 {
     Matrix<TConfig> &Ac = this->getNextLevel( MemorySpace( ) )->getA();
 
+    // SA path: use the smoothed prolongator P for grid transfer.
+    // x += P * e  (alpha = 1, no error scaling for SA)
+    if (m_null_dim > 0 && m_P_tent.get_num_rows() > 0)
+    {
+        VVector prolongated(this->A->get_num_rows());
+        fill(prolongated, types::util<ValueTypeB>::get_zero());
+        multiply(m_P_tent, e, prolongated, OWNED);
+        ValueTypeB one = types::util<ValueTypeB>::get_one();
+        axpy(prolongated, x, one);
+    }
     //this is dirty, but error scaling 2 and 3 do not have a specialized version. Instead, the general version sits in the 4x4 function
-    if ( this->m_error_scaling >= 2 )
+    else if ( this->m_error_scaling >= 2 )
     {
         prolongateAndApplyCorrection_4x4(e, bf, x, tmp);
     }
@@ -876,7 +914,13 @@ void Aggregation_AMG_Level_Base<T_Config >::prolongateAndApplyCorrection(VVector
 template <class T_Config>
 void Aggregation_AMG_Level_Base<T_Config>::restrictResidual(VVector &r, VVector &rr)
 {
-    if (this->A->get_block_size() == 1)
+    // SA path: use the pre-computed transpose P^T for restriction.
+    // rr = P^T * r  (CSR SpMV with the stored transpose)
+    if (m_null_dim > 0 && m_P_tent_T.get_num_rows() > 0)
+    {
+        multiply(m_P_tent_T, r, rr, OWNED);
+    }
+    else if (this->A->get_block_size() == 1)
     {
         restrictResidual_1x1(r, rr);
     }
@@ -1994,9 +2038,100 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
         computeRestrictionOperator();
     }
 
+    // --- SA path: check if near-null space is available ---
+    // On the finest level, pull near-null space from the AMG object
+    if (m_null_dim == 0 && this->amg != nullptr && this->amg->hasSANearNullSpace())
+    {
+        const std::vector<double> &nns = this->amg->getSANearNullSpace();
+        int nd = this->amg->getSANullDim();
+        int nr = this->amg->getSANullRows();
+        setNearNullSpace(nd, nr, nns.data());
+    }
+
+    // SA is only supported for real-valued types (float/double), not complex.
+    // Use sizeof check: for real types, sizeof(ValueTypeB) == sizeof(PODType);
+    // for complex types, sizeof(ValueTypeB) == 2 * sizeof(PODType).
+    if (m_null_dim > 0 && sizeof(ValueTypeB) == sizeof(typename types::PODTypes<ValueTypeB>::type))
+    {
+        // SA path: build P_tent via QR, smooth it, then use for RAP
+        // === Compact aggregate IDs to remove gaps ===
+        // The selector may produce non-contiguous aggregate IDs (e.g., 0, 2, 5, 7
+        // with gaps at 1, 3, 4, 6). P_tent needs contiguous column indices.
+        {
+            int num_fine = m_aggregates.size();
+            // 1. Copy aggregates, sort, unique to find the set of used IDs
+            IVector sorted_aggs(m_aggregates);
+            thrust_wrapper::sort<TConfig::memSpace>(sorted_aggs.begin(), sorted_aggs.begin() + num_fine);
+            auto new_end = amgx::thrust::unique(sorted_aggs.begin(), sorted_aggs.begin() + num_fine);
+            int num_unique = (int)(new_end - sorted_aggs.begin());
+
+            if (num_unique < m_num_aggregates)
+            {
+
+                // 2. Create mapping: for each fine node, find its new contiguous ID
+                //    new_id = lower_bound position in sorted_unique array
+                IVector new_aggs(num_fine);
+                amgx::thrust::lower_bound(sorted_aggs.begin(), sorted_aggs.begin() + num_unique,
+                                           m_aggregates.begin(), m_aggregates.begin() + num_fine,
+                                           new_aggs.begin());
+
+                // 3. Copy back and update count
+                thrust_wrapper::copy<TConfig::memSpace>(new_aggs.begin(), new_aggs.begin() + num_fine,
+                                                         m_aggregates.begin());
+                m_num_aggregates = num_unique;
+            }
+        }
+        buildTentativeProlongator();
+        smoothProlongator();
+        // Compute and store P^T for use in restrictResidual()
+        transpose(m_P_tent, m_P_tent_T);
+
+        // Propagate coarse near-null space to the next level
+        AMG_Level<TConfig> *next = this->getNextLevel(MemorySpace());
+        Aggregation_AMG_Level_Base<TConfig> *next_agg =
+            dynamic_cast<Aggregation_AMG_Level_Base<TConfig>*>(next);
+        if (next_agg != nullptr && m_coarse_near_null_space.size() > 0)
+        {
+            int coarse_dofs = m_num_aggregates * m_null_dim;
+            int total = coarse_dofs * m_null_dim;
+
+            // Copy device near-null space to host and convert to double.
+            // For real types (float/double), ValueTypeB == PODType, so static_cast works.
+            std::vector<ValueTypeB> h_vtmp(total);
+            cudaMemcpy(h_vtmp.data(), m_coarse_near_null_space.raw(),
+                       total * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            cudaCheckError();
+
+            std::vector<double> h_coarse_nns_double(total);
+            for (int i = 0; i < total; ++i)
+            {
+                // This static_cast is safe because we've verified ValueTypeB is a real type above
+                h_coarse_nns_double[i] = static_cast<double>(
+                    *reinterpret_cast<typename types::PODTypes<ValueTypeB>::type*>(&h_vtmp[i]));
+            }
+
+            next_agg->setNearNullSpace(m_null_dim, coarse_dofs, h_coarse_nns_double.data());
+        }
+    }
+    // --- End SA path ---
+
     Ac.set_initialized(0);
     Ac.copyAuxData(&A);
-    this->m_coarseAGenerator->computeAOperator(A, Ac, this->m_aggregates, this->m_R_row_offsets, this->m_R_column_indices, this->m_num_all_aggregates);
+    // SA path: use the real-valued smoothed P and P^T for the Galerkin triple product.
+    // The standard coarse-A generators use an implicit boolean P (aggregate injection),
+    // which is incorrect for SA.  CSR_Multiply::csr_galerkin_product handles real-valued P.
+    if (m_null_dim > 0 && m_P_tent.get_num_rows() > 0)
+    {
+        CSR_Multiply<TConfig>::csr_galerkin_product(
+            m_P_tent_T, A, m_P_tent, Ac,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    }
+    else
+    {
+        this->m_coarseAGenerator->computeAOperator(A, Ac, this->m_aggregates, this->m_R_row_offsets, this->m_R_column_indices, this->m_num_all_aggregates);
+    }
+    // --- Dump A, P, Ac to files for Python verification (finest level only) ---
+
     Ac.setColsReorderedByColor(false);
     Ac.setView(FULL);
 
@@ -2642,12 +2777,636 @@ void Aggregation_AMG_Level_Base<T_Config>::consolidateCoarseGridMatrix()
 }
 
 // -------------------------------------------------------------
+// Near-null space helpers
+// -------------------------------------------------------------
+
+// Device-side scalar conversion: double -> ValueType.
+// For real types (float, double) this is a plain cast.
+// For complex types (cuComplex, cuDoubleComplex) the imaginary part is zero.
+template <typename ValueType>
+static __device__ __inline__ ValueType double_to_valuetype(double v)
+{
+    return static_cast<ValueType>(v);   // works for float and double
+}
+
+template <>
+__device__ __inline__ cuComplex double_to_valuetype<cuComplex>(double v)
+{
+    return make_cuComplex(static_cast<float>(v), 0.f);
+}
+
+template <>
+__device__ __inline__ cuDoubleComplex double_to_valuetype<cuDoubleComplex>(double v)
+{
+    return make_cuDoubleComplex(v, 0.);
+}
+
+// Kernel: copy-convert double host data to device ValueType vector.
+// Each thread handles one element.
+template <typename ValueType>
+__global__
+void copy_double_to_valuetype_kernel(const double * __restrict__ src,
+                                     ValueType * __restrict__ dst,
+                                     int n)
+{
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    if (tid < n)
+        dst[tid] = double_to_valuetype<ValueType>(src[tid]);
+}
+
+// setNearNullSpace: upload host double data to device VVector.
+// Works for both float and double solver precision.
+template <class T_Config>
+void Aggregation_AMG_Level_Base<T_Config>::setNearNullSpace(
+    int null_dim, int num_rows, const double *data)
+{
+    m_null_dim = null_dim;
+    int total = null_dim * num_rows;
+
+    // Allocate a temporary host double vector and copy to device
+    thrust::device_vector<double> d_tmp(data, data + total);
+
+    // Resize the device near-null space vector
+    m_near_null_space.resize(total);
+
+    // Launch kernel to convert double -> ValueTypeB
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    copy_double_to_valuetype_kernel<ValueTypeB><<<blocks, threads>>>(
+        thrust::raw_pointer_cast(d_tmp.data()),
+        m_near_null_space.raw(),
+        total);
+    cudaCheckError();
+}
+
+// ---------------------------------------------------------------
+// Kernels for buildTentativeProlongator
+// ---------------------------------------------------------------
+
+// Expand node-level aggregates to DOF-level aggregates.
+// For DOF row d, dof_aggregates[d] = aggregates[d / block_size].
+template <typename IndexType>
+__global__
+void expand_aggregates_kernel(const IndexType * __restrict__ aggregates,
+                              IndexType * __restrict__ dof_aggregates,
+                              int num_fine_rows,
+                              int block_size)
+{
+    for (int d = blockDim.x * blockIdx.x + threadIdx.x;
+         d < num_fine_rows;
+         d += gridDim.x * blockDim.x)
+    {
+        dof_aggregates[d] = aggregates[d / block_size];
+    }
+}
+
+// Fill the CSR arrays (row_offsets, col_indices, values) for P_tent.
+// Each fine DOF row i has exactly null_dim nonzero entries.
+// row_offsets[i] = i * null_dim
+// col_indices[i*null_dim + k] = aggregates[i/block_size] * null_dim + k
+// values[i*null_dim + k] = P_tent_vals[i*null_dim + k]
+template <typename IndexType, typename ValueTypeIn, typename ValueTypeOut>
+__global__
+void fill_P_tent_csr_kernel(
+    int num_fine_rows,
+    int null_dim,
+    int block_size,
+    const IndexType * __restrict__ aggregates,
+    const ValueTypeIn * __restrict__ P_tent_vals,
+    IndexType * __restrict__ row_offsets,
+    IndexType * __restrict__ col_indices,
+    ValueTypeOut * __restrict__ values)
+{
+    // Fill row_offsets (num_fine_rows + 1 entries)
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x;
+         i <= num_fine_rows;
+         i += gridDim.x * blockDim.x)
+    {
+        row_offsets[i] = i * null_dim;
+    }
+
+    // Fill col_indices and values (num_fine_rows * null_dim entries)
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x;
+         i < num_fine_rows;
+         i += gridDim.x * blockDim.x)
+    {
+        int node = i / block_size;
+        int agg = aggregates[node];
+        for (int k = 0; k < null_dim; ++k)
+        {
+            int idx = i * null_dim + k;
+            col_indices[idx] = agg * null_dim + k;
+            // Copy value; for same-type this is identity, for mixed precision
+            // the compiler handles float<->double conversion.
+            // For complex types this kernel is never called (SA not supported).
+            ValueTypeIn tmp = P_tent_vals[idx];
+            ValueTypeOut *dst = &values[idx];
+            // Use memcpy for type-punning safety when types differ in size
+            if (sizeof(ValueTypeIn) == sizeof(ValueTypeOut))
+                *dst = *reinterpret_cast<ValueTypeOut*>(&tmp);
+            else
+            {
+                // Mixed precision real: e.g., double -> float
+                typename types::PODTypes<ValueTypeIn>::type pod_in =
+                    *reinterpret_cast<typename types::PODTypes<ValueTypeIn>::type*>(&tmp);
+                typename types::PODTypes<ValueTypeOut>::type pod_out =
+                    static_cast<typename types::PODTypes<ValueTypeOut>::type>(pod_in);
+                *dst = *reinterpret_cast<ValueTypeOut*>(&pod_out);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// buildTentativeProlongator
+// ---------------------------------------------------------------
+
+template <class T_Config>
+void Aggregation_AMG_Level_Base<T_Config>::buildTentativeProlongator()
+{
+    if (m_null_dim <= 0)
+    {
+        FatalError("buildTentativeProlongator: null_dim not set", AMGX_ERR_BAD_PARAMETERS);
+    }
+
+    if (m_near_null_space.size() == 0)
+    {
+        FatalError("buildTentativeProlongator: near-null space not set", AMGX_ERR_BAD_PARAMETERS);
+    }
+
+    Matrix<TConfig> &A = this->getA();
+    int block_size = A.get_block_dimy();
+    int num_nodes  = A.get_num_rows();       // block-rows (nodes)
+    int num_fine_rows = num_nodes * block_size;  // total DOF rows
+    int num_coarse_cols = m_num_aggregates * m_null_dim;
+    int nnz = num_fine_rows * m_null_dim;
+
+    // ----------------------------------------------------------
+    // 1. Expand node-level aggregates to DOF-level aggregates
+    // ----------------------------------------------------------
+    IVector dof_aggregates(num_fine_rows);
+    {
+        const int threads = 256;
+        const int blocks = std::min(4096, (num_fine_rows + threads - 1) / threads);
+        expand_aggregates_kernel<IndexType><<<blocks, threads>>>(
+            m_aggregates.raw(),
+            dof_aggregates.raw(),
+            num_fine_rows,
+            block_size);
+        cudaCheckError();
+    }
+
+    // ----------------------------------------------------------
+    // 2. Build aggregate row lists at DOF level
+    // ----------------------------------------------------------
+    IVector agg_row_offsets(m_num_aggregates + 1);
+    IVector agg_rows(num_fine_rows);
+
+    build_agg_row_lists(num_fine_rows,
+                        m_num_aggregates,
+                        dof_aggregates.raw(),
+                        agg_row_offsets.raw(),
+                        agg_rows.raw());
+
+    // ----------------------------------------------------------
+    // 3. Run batched QR on the near-null space
+    // ----------------------------------------------------------
+    VVector P_tent_vals(nnz);
+    VVector R_out(m_num_aggregates * m_null_dim * m_null_dim);
+
+    batched_qr<ValueTypeB>(m_num_aggregates,
+                           m_null_dim,
+                           num_fine_rows,
+                           agg_row_offsets.raw(),
+                           agg_rows.raw(),
+                           m_near_null_space.raw(),
+                           P_tent_vals.raw(),
+                           R_out.raw());
+
+    // ----------------------------------------------------------
+    // 4. Build P_tent CSR matrix
+    // ----------------------------------------------------------
+    m_P_tent.set_initialized(0);
+    m_P_tent.addProps(CSR);
+    // P_tent is a scalar (1x1 block) matrix at the DOF level
+    m_P_tent.resize(num_fine_rows, num_coarse_cols, nnz, 1, 1, 1);
+
+    {
+        const int threads = 256;
+        const int blocks = std::min(4096, (num_fine_rows + threads) / threads);
+        fill_P_tent_csr_kernel<<<blocks, threads>>>(
+            num_fine_rows,
+            m_null_dim,
+            block_size,
+            m_aggregates.raw(),
+            P_tent_vals.raw(),
+            m_P_tent.row_offsets.raw(),
+            m_P_tent.col_indices.raw(),
+            m_P_tent.values.raw());
+        cudaCheckError();
+    }
+
+    m_P_tent.set_initialized(1);
+
+    // ----------------------------------------------------------
+    // 5. Store coarse near-null space (R factors from QR)
+    //    Reshape from per-aggregate column-major R to global
+    //    column-major B_c layout for the next coarser level.
+    // ----------------------------------------------------------
+    int total_R = m_num_aggregates * m_null_dim * m_null_dim;
+    m_coarse_near_null_space.resize(total_R);
+    {
+        const int threads = 256;
+        const int blocks = std::min(4096, (total_R + threads - 1) / threads);
+        reshape_R_to_coarse_B_kernel<ValueTypeB><<<blocks, threads>>>(
+            m_num_aggregates,
+            m_null_dim,
+            R_out.raw(),
+            m_coarse_near_null_space.raw());
+        cudaCheckError();
+    }
+}
+
+// ---------------------------------------------------------------
+// Kernel for estimateSADampingFactor: apply point D^{-1} to a vector
+// ---------------------------------------------------------------
+
+template <typename IndexType, typename MatValueType, typename VecValueType>
+__global__
+void apply_point_dinv_kernel(
+    int num_dofs,
+    int block_size,
+    const IndexType * __restrict__ diag_offsets,  // A.diag, length num_rows
+    const MatValueType * __restrict__ A_values,    // A.values (MatPrec)
+    VecValueType * __restrict__ w)                 // vector to scale by D^{-1} (VecPrec)
+{
+    for (int dof = blockDim.x * blockIdx.x + threadIdx.x; dof < num_dofs; dof += gridDim.x * blockDim.x)
+    {
+        int node = dof / block_size;
+        int local = dof % block_size;
+        IndexType diag_nz = diag_offsets[node];
+        MatValueType diag_val = A_values[diag_nz * block_size * block_size + local * block_size + local];
+        if (!types::util<MatValueType>::is_zero(diag_val))
+        {
+            w[dof] = w[dof] / diag_val;
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// estimateSADampingFactor
+// ---------------------------------------------------------------
+//
+// Returns the SA damping factor omega = 1.4 / rho(D^{-1}A).
+// Uses power iteration to estimate rho(D^{-1}A): the spectral radius
+// of the Jacobi-preconditioned operator.  Starting from a vector of
+// ones, each iteration applies A then D^{-1} and tracks the Rayleigh
+// quotient.  Convergence is typically reached in 10-20 iterations.
+
+template <class T_Config>
+typename T_Config::VecPrec
+Aggregation_AMG_Level_Base<T_Config>::estimateSADampingFactor(int max_iter)
+{
+    Matrix<TConfig> &A = this->getA();
+    int block_size    = A.get_block_dimy();
+    int num_rows      = A.get_num_rows();
+    int num_dofs      = num_rows * block_size;
+
+    // Fallback: if matrix is empty or diagonal array not allocated, return 0.7 (= 1.4/2).
+    if (num_dofs == 0 || A.diag.size() == 0)
+    {
+        ValueTypeB omega_fb = types::util<ValueTypeB>::get_one();
+        typedef typename types::PODTypes<ValueTypeB>::type PodB_fb;
+        omega_fb = omega_fb * static_cast<PodB_fb>(0.7);
+        return omega_fb;
+    }
+
+    // Clamp iteration count.
+    if (max_iter <= 0) max_iter = 20;
+
+    // Allocate work vectors (DOF-level, block_dimy set for SpMV).
+    VVector w(num_dofs, types::util<ValueTypeB>::get_one());
+    VVector v(num_dofs, types::util<ValueTypeB>::get_zero());
+    w.set_block_dimy(block_size);
+    w.set_block_dimx(1);
+    v.set_block_dimy(block_size);
+    v.set_block_dimx(1);
+
+    const int threads = 256;
+    const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
+
+    typedef typename types::PODTypes<ValueTypeB>::type PodB;
+    ValueTypeB lambda = types::util<ValueTypeB>::get_one();
+
+    for (int iter = 0; iter < max_iter; ++iter)
+    {
+        // v = A * w  (SpMV, owned rows only)
+        thrust_wrapper::fill<TConfig::memSpace>(v.begin(), v.end(),
+                                                types::util<ValueTypeB>::get_zero());
+        multiply(A, w, v, OWNED);
+
+        // v = D^{-1} * v  (point diagonal scaling)
+        apply_point_dinv_kernel<<<blocks, threads>>>(
+            num_dofs, block_size,
+            A.diag.raw(),
+            A.values.raw(),
+            v.raw());
+        cudaCheckError();
+
+        // Rayleigh quotient: lambda = <w, v> / <w, w>
+        ValueTypeB wv = amgx::thrust::inner_product(
+            w.begin(), w.begin() + num_dofs,
+            v.begin(), types::util<ValueTypeB>::get_zero());
+        ValueTypeB ww = amgx::thrust::inner_product(
+            w.begin(), w.begin() + num_dofs,
+            w.begin(), types::util<ValueTypeB>::get_zero());
+        cudaCheckError();
+
+        if (!types::util<ValueTypeB>::is_zero(ww))
+            lambda = wv / ww;
+
+        // Normalize: w = v / ||v||
+        ValueTypeB vv = amgx::thrust::inner_product(
+            v.begin(), v.begin() + num_dofs,
+            v.begin(), types::util<ValueTypeB>::get_zero());
+        cudaCheckError();
+        PodB norm_v = std::sqrt(static_cast<PodB>(types::util<ValueTypeB>::abs(vv)));
+        if (norm_v > (PodB)0.0)
+        {
+            ValueTypeB inv_norm = types::util<ValueTypeB>::get_one();
+            // Scale inv_norm by 1/norm_v using POD arithmetic.
+            inv_norm = inv_norm * static_cast<PodB>(1.0 / norm_v);
+            amgx::thrust::transform(v.begin(), v.begin() + num_dofs,
+                                    w.begin(),
+                                    amgx::thrust::placeholders::_1 * inv_norm);
+            cudaCheckError();
+        }
+    }
+
+    // omega = 1.4 / rho(D^{-1}A)
+    PodB lambda_pod = static_cast<PodB>(types::util<ValueTypeB>::abs(lambda));
+    ValueTypeB omega = types::util<ValueTypeB>::get_one();
+    if (lambda_pod > (PodB)0.0)
+    {
+        PodB omega_pod = static_cast<PodB>(1.4) / lambda_pod;
+        omega = omega * omega_pod;
+    }
+
+
+    return omega;
+}
+
+// ---------------------------------------------------------------
+// Kernel for smoothProlongator: pattern-preserving SA smoothing
+// ---------------------------------------------------------------
+//
+// Computes P_smooth = (I - omega * D^{-1} * A) * P_tent, keeping only
+// entries in P_tent's sparsity pattern (pattern-preserving SA).
+//
+// For each fine DOF row i (with node = i/block_size, local = i%block_size):
+//   agg_i = aggregates[node]
+//   For each null-space column k = 0..null_dim-1:
+//     P_smooth[i, agg_i*null_dim+k] =
+//       Q[i,k] - omega / d_ii * sum_{j in row(A,node)} sum_{l=0..bs-1}
+//                                  A[i, j*bs+l] * Q[j*bs+l, k] * delta(agg(j)==agg_i)
+//
+// The delta(agg(j)==agg_i) restriction is what makes this pattern-preserving:
+// only neighbors in the same aggregate contribute, so the result has the same
+// sparsity as P_tent.
+
+template <typename IndexType, typename MatValueType, typename PValueType>
+__global__
+void smooth_prolongator_kernel(
+    int num_fine_rows,
+    int null_dim,
+    int block_size,
+    MatValueType omega,
+    // A matrix (block CSR)
+    const IndexType * __restrict__ A_row_offsets,
+    const IndexType * __restrict__ A_col_indices,
+    const MatValueType * __restrict__ A_values,
+    const IndexType * __restrict__ A_diag,
+    // Aggregates (node-level)
+    const IndexType * __restrict__ aggregates,
+    // Q values (copy of P_tent values before smoothing) — read-only
+    const PValueType * __restrict__ Q_vals,   // [num_fine_rows * null_dim]
+    // P_smooth values — output (same sparsity as P_tent)
+    PValueType * __restrict__ P_vals)         // [num_fine_rows * null_dim]
+{
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x;
+         i < num_fine_rows;
+         i += gridDim.x * blockDim.x)
+    {
+        int node_i  = i / block_size;
+        int local_i = i % block_size;
+        int agg_i   = aggregates[node_i];
+
+        // Get point diagonal d_ii from A's diagonal block
+        IndexType diag_nz = A_diag[node_i];
+        MatValueType d_ii = A_values[diag_nz * block_size * block_size
+                                     + local_i * block_size + local_i];
+        MatValueType inv_d = types::util<MatValueType>::is_zero(d_ii)
+                             ? types::util<MatValueType>::get_zero()
+                             : types::util<MatValueType>::get_one() / d_ii;
+
+        // For each null-space column k
+        for (int k = 0; k < null_dim; ++k)
+        {
+            // Compute (A * P_tent_col_k)[i] restricted to same-aggregate
+            MatValueType ap = types::util<MatValueType>::get_zero();
+
+            int row_start = A_row_offsets[node_i];
+            int row_end   = A_row_offsets[node_i + 1];
+
+            for (int nz = row_start; nz < row_end; ++nz)
+            {
+                int node_j = A_col_indices[nz];
+
+
+                // Sum over local DOFs within the block
+                for (int local_j = 0; local_j < block_size; ++local_j)
+                {
+                    int j_dof = node_j * block_size + local_j;
+                    MatValueType a_ij = A_values[nz * block_size * block_size
+                                                 + local_i * block_size + local_j];
+                    // Q_vals is PValueType (MatPrec from MVector), same as MatValueType
+                    // when called from smoothProlongator. Direct multiply is safe.
+                    ap = ap + a_ij * Q_vals[j_dof * null_dim + k];
+                }
+            }
+
+            // P_smooth[i, k] = Q[i, k] - omega * inv_d * (A * P_tent_col_k)[i]
+            P_vals[i * null_dim + k] =
+                Q_vals[i * null_dim + k] - omega * inv_d * ap;
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------
+// Kernel: build S = I - omega * D^{-1} * A  (scalar CSR, block_size==1)
+// ---------------------------------------------------------------
+template <typename IndexType, typename ValueType, typename PodType>
+__global__
+void build_SA_smoother_kernel(
+    int num_rows,
+    PodType omega,
+    const IndexType * __restrict__ row_offsets,
+    const IndexType * __restrict__ col_indices,
+    const ValueType * __restrict__ A_values,
+    const IndexType * __restrict__ A_diag,
+    ValueType * __restrict__ S_values)
+{
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x;
+         i < num_rows;
+         i += gridDim.x * blockDim.x)
+    {
+        // Get diagonal value
+        IndexType diag_nz = A_diag[i];
+        ValueType d_ii = A_values[diag_nz];
+        ValueType inv_d = types::util<ValueType>::is_zero(d_ii)
+                          ? types::util<ValueType>::get_zero()
+                          : types::util<ValueType>::get_one() / d_ii;
+
+        int row_start = row_offsets[i];
+        int row_end   = row_offsets[i + 1];
+
+        // Convert omega (PodType = real scalar) to ValueType for mixed arithmetic
+        ValueType omega_v = types::util<ValueType>::get_one();
+        omega_v = omega_v * omega;  // works for both real and complex
+
+        for (int nz = row_start; nz < row_end; ++nz)
+        {
+            int j = col_indices[nz];
+            ValueType a_ij = A_values[nz];
+            // S[i,j] = delta(i,j) - omega * a_ij / d_ii
+            ValueType s_ij = types::util<ValueType>::get_zero() - omega_v * inv_d * a_ij;
+            if (j == i)
+                s_ij = s_ij + types::util<ValueType>::get_one();
+            S_values[nz] = s_ij;
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// smoothProlongator
+// ---------------------------------------------------------------
+//
+// Smooths the tentative prolongator m_P_tent in-place using
+// pattern-preserving SA:  P = (I - omega * D^{-1} * A) * P_tent
+//
+// After this call, m_P_tent.values contains the smoothed prolongator
+// values.  The sparsity pattern (row_offsets, col_indices) is unchanged.
+
+template <class T_Config>
+void Aggregation_AMG_Level_Base<T_Config>::smoothProlongator()
+{
+    if (m_null_dim <= 0 || m_P_tent.get_num_rows() == 0)
+        FatalError("smoothProlongator: P_tent not built", AMGX_ERR_BAD_PARAMETERS);
+
+    Matrix<TConfig> &A = this->getA();
+    int block_size     = A.get_block_dimy();
+    int num_rows       = A.get_num_rows();   // node-level rows
+
+    // Estimate damping factor omega = 1.4 / rho(D^{-1}A)
+    ValueTypeB omega_b = estimateSADampingFactor();
+    typedef typename types::PODTypes<ValueTypeB>::type PodB;
+    PodB omega_pod = types::util<ValueTypeB>::abs(omega_b);
+
+
+
+    // ---------------------------------------------------------------
+    // Build S = I - omega * D^{-1} * A  as an explicit CSR matrix.
+    //
+    // For block_size == 1 (scalar): S has the same sparsity as A.
+    //   S[i,j] = -omega / A[i,i] * A[i,j]   for j != i
+    //   S[i,i] = 1 - omega
+    //
+    // For block_size > 1: not yet supported.
+    // ---------------------------------------------------------------
+    if (block_size != 1)
+        FatalError("smoothProlongator: block_size > 1 not yet supported for SA", AMGX_ERR_NOT_IMPLEMENTED);
+
+    // S has the same sparsity as A (scalar CSR, 1x1 blocks)
+    int S_nnz = A.get_num_nz();
+    Matrix<TConfig> S;
+    S.set_initialized(0);
+    S.addProps(CSR);
+    S.resize(num_rows, num_rows, S_nnz, 1, 1, 1);
+
+    // Copy A's sparsity pattern to S
+    thrust_wrapper::copy<TConfig::memSpace>(
+        A.row_offsets.begin(), A.row_offsets.begin() + num_rows + 1,
+        S.row_offsets.begin());
+    thrust_wrapper::copy<TConfig::memSpace>(
+        A.col_indices.begin(), A.col_indices.begin() + S_nnz,
+        S.col_indices.begin());
+    cudaCheckError();
+
+    // Compute S values: S[i,j] = delta(i,j) - omega * A[i,j] / A[i,i]
+    {
+        const int threads = 256;
+        const int blocks  = std::min(4096, (num_rows + threads - 1) / threads);
+        build_SA_smoother_kernel<<<blocks, threads>>>(
+            num_rows,
+            omega_pod,
+            A.row_offsets.raw(),
+            A.col_indices.raw(),
+            A.values.raw(),
+            A.diag.raw(),
+            S.values.raw());
+        cudaCheckError();
+    }
+
+    S.set_initialized(1);
+
+
+    // ---------------------------------------------------------------
+    // Compute P_smooth = S * P_tent via SpGEMM
+    // ---------------------------------------------------------------
+    Matrix<TConfig> P_smooth;
+    CSR_Multiply<TConfig>::csr_multiply(S, m_P_tent, P_smooth, NULL);
+
+
+    // Replace m_P_tent with the smoothed prolongator
+    m_P_tent.swap(P_smooth);
+
+
+}
+
+// -------------------------------------------------------------
 // Explicit instantiations
 // -------------------------------------------------------------
 
 #define AMGX_CASE_LINE(CASE) template class Aggregation_AMG_Level<TemplateMode<CASE>::Type>;
 AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
 AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+// Explicit instantiations for setNearNullSpace (base class method)
+#define AMGX_CASE_LINE(CASE) \
+    template void Aggregation_AMG_Level_Base<TemplateMode<CASE>::Type>::setNearNullSpace( \
+        int, int, const double *);
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+// Explicit instantiations for buildTentativeProlongator (base class method)
+#define AMGX_CASE_LINE(CASE) \
+    template void Aggregation_AMG_Level_Base<TemplateMode<CASE>::Type>::buildTentativeProlongator();
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+// Explicit instantiations for estimateSADampingFactor (base class method)
+#define AMGX_CASE_LINE(CASE) \
+    template typename TemplateMode<CASE>::Type::VecPrec \
+    Aggregation_AMG_Level_Base<TemplateMode<CASE>::Type>::estimateSADampingFactor(int);
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+// Explicit instantiations for smoothProlongator (base class method)
+#define AMGX_CASE_LINE(CASE) \
+    template void Aggregation_AMG_Level_Base<TemplateMode<CASE>::Type>::smoothProlongator();
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
 #undef AMGX_CASE_LINE
 }
 

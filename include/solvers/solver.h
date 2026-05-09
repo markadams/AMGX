@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <vector>
+
 namespace amgx
 {
 template<class Matrix> class Solver;
@@ -183,6 +185,10 @@ class Solver : public AuxData
         bool decr_ref_count() { return --m_ref_count == 0; }
 
         void setGluedSetup(bool val) { m_skip_glued_setup = val; }
+
+        // Virtual method for passing near-null space data to AMG solvers.
+        // Default implementation does nothing (non-AMG solvers don't need it).
+        virtual void setNearNullSpace(int null_dim, int num_rows, const std::vector<double> &data) {}
 
         // tag used for communication
         int tag;

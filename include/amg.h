@@ -34,6 +34,7 @@ struct opposite_memspace<AMGX_device>
 #include <amg_level.h>
 #include <misc.h>
 #include <sstream>
+#include <vector>
 
 namespace amgx
 {
@@ -75,6 +76,24 @@ class AMG
         std::string m_cfg_scope;
 
         ThreadManager *tmng;
+
+        // Near-null space for Smoothed Aggregation (stored on host, double precision).
+        // Set by the user via AMGX_solver_set_near_null_space() → AMG_Solver → here.
+        std::vector<double> m_sa_near_null_space;  // column-major, null_dim columns of length null_rows
+        int m_sa_null_dim  = 0;
+        int m_sa_null_rows = 0;
+
+        void setSANearNullSpace(int null_dim, int num_rows, const std::vector<double> &data)
+        {
+            m_sa_null_dim  = null_dim;
+            m_sa_null_rows = num_rows;
+            m_sa_near_null_space = data;
+        }
+
+        bool hasSANearNullSpace() const { return !m_sa_near_null_space.empty(); }
+        int getSANullDim() const { return m_sa_null_dim; }
+        int getSANullRows() const { return m_sa_null_rows; }
+        const std::vector<double> &getSANearNullSpace() const { return m_sa_near_null_space; }
 
         AMG(AMG_Config &cfg, const std::string &cfg_scope);
         ~AMG();

@@ -26,7 +26,7 @@ class Chebyshev_Solver : public Solver<T_Config>
         // Temporary vectors needed for the computation.
         VVector m_p, m_Ap, m_z, m_xp, m_rp;
         // The dot product between z and the residual.
-        ValueTypeB m_r_z, m_lmax, m_lmin, m_gamma, m_beta;
+        ValueTypeB m_r_z, m_lmax, m_lmin, m_lmin_denom, m_gamma, m_beta;
         int m_buffer_N, first_iter;
 
         int m_lambda_mode, m_cheby_order;

@@ -38,6 +38,7 @@
 #include "amgx_c_wrappers.inl"
 #include "amgx_c_common.h"
 #include "multiply.h"
+#include <aggregation/near_null_space.h>
 
 namespace amgx
 {
@@ -5353,6 +5354,94 @@ extern "C" {
     int AMGX_Debug_get_resource_count(AMGX_resources_handle rsc)
     {
         return ((ResourceW *)rsc)->wrapped().use_count();
+    }
+
+    AMGX_RC AMGX_API AMGX_solver_set_near_null_space(
+        AMGX_solver_handle slv,
+        int null_dim,
+        int num_rows,
+        const double *data)
+    {
+        nvtxRange nvrf(__func__);
+        Resources *resources;
+        AMGX_CHECK_API_ERROR_NORSRC(getAMGXerror(getResourcesFromSolverHandle(slv, &resources)));
+        AMGX_ERROR rc = AMGX_OK;
+
+        AMGX_TRIES()
+        {
+            if (null_dim <= 0 || num_rows <= 0 || data == nullptr)
+            {
+                AMGX_CHECK_API_ERROR(AMGX_ERR_BAD_PARAMETERS, resources);
+            }
+
+            AMGX_Mode mode = get_mode_from<AMGX_solver_handle>(slv);
+
+            switch (mode)
+            {
+#define AMGX_CASE_LINE(CASE) case CASE: { \
+                auto *solver = get_mode_object_from<CASE, AMG_Solver, AMGX_solver_handle>(slv); \
+                solver->setNearNullSpace(null_dim, num_rows, data); \
+                break; \
+            }
+                AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+                AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+                default:
+                    AMGX_CHECK_API_ERROR(AMGX_ERR_BAD_MODE, resources);
+            }
+        }
+
+        AMGX_CATCHES(rc)
+        return getCAPIerror_x(rc);
+    }
+
+    AMGX_RC AMGX_API AMGX_solver_set_coordinates(
+        AMGX_solver_handle slv,
+        int dim,
+        int num_nodes,
+        const double *coords)
+    {
+        nvtxRange nvrf(__func__);
+        Resources *resources;
+        AMGX_CHECK_API_ERROR_NORSRC(getAMGXerror(getResourcesFromSolverHandle(slv, &resources)));
+        AMGX_ERROR rc = AMGX_OK;
+
+        AMGX_TRIES()
+        {
+            if (dim < 1 || dim > 3 || num_nodes <= 0 || coords == nullptr)
+            {
+                AMGX_CHECK_API_ERROR(AMGX_ERR_BAD_PARAMETERS, resources);
+            }
+
+            // Compute rigid body modes on the host
+            int null_dim = 0;
+            int num_rows = num_nodes * dim;
+            // Maximum null_dim is 6 (3D elasticity)
+            std::vector<double> B(6 * num_rows, 0.0);
+            amgx::aggregation::computeRigidBodyModes(
+                dim, dim, num_nodes, coords, null_dim, B.data());
+
+            // Forward to setNearNullSpace via the existing API
+            AMGX_Mode mode = get_mode_from<AMGX_solver_handle>(slv);
+            switch (mode)
+            {
+#define AMGX_CASE_LINE(CASE) case CASE: { \
+                auto *solver = get_mode_object_from<CASE, AMG_Solver, AMGX_solver_handle>(slv); \
+                solver->setNearNullSpace(null_dim, num_rows, B.data()); \
+                break; \
+            }
+                AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+                AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+                default:
+                    AMGX_CHECK_API_ERROR(AMGX_ERR_BAD_MODE, resources);
+            }
+        }
+
+        AMGX_CATCHES(rc)
+        return getCAPIerror_x(rc);
     }
 
 }//extern "C"

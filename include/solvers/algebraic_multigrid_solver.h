@@ -48,6 +48,12 @@ class AlgebraicMultigrid_Solver: public Solver<T_Config>
 
         void SetThreadManager(ThreadManager *tmng) { m_amg.tmng = tmng; }
 
+        // Forward near-null space data to the AMG object for Smoothed Aggregation.
+        void setNearNullSpace(int null_dim, int num_rows, const std::vector<double> &data) override
+        {
+            m_amg.setSANearNullSpace(null_dim, num_rows, data);
+        }
+
         // Destructor
         ~AlgebraicMultigrid_Solver();
 

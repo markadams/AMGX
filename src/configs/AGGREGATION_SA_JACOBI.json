@@ -1,0 +1,25 @@
+{
+    "config_version": 2,
+    "solver": {
+        "print_grid_stats": 1,
+        "algorithm": "AGGREGATION",
+        "obtain_timings": 1,
+        "solver": "AMG",
+        "smoother": "BLOCK_JACOBI",
+        "print_solve_stats": 1,
+        "presweeps": 2,
+        "selector": "SIZE_8",
+        "convergence": "RELATIVE_INI",
+        "coarsest_sweeps": 6,
+        "max_iters": 100,
+        "monitor_residual": 1,
+        "min_coarse_rows": 32,
+        "relaxation_factor": 0.75,
+        "scope": "main",
+        "max_levels": 20,
+        "postsweeps": 2,
+        "tolerance": 1e-08,
+        "norm": "L2",
+        "cycle": "V"
+    }
+}

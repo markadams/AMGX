@@ -152,8 +152,21 @@ Chebyshev_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
 
     // m_lambda_mode:
     // 0: use eigensolver to get lmin and lmax estimate
-    // 1: use eigensolver to get lmax estimate, set lmin = lmax/8
-    // 2: use max row sum as lmax estimate, set lmin = lmax/8
+    // 1: use eigensolver to get lmax estimate, set lmin = lmax / 3^D
+    // 2: use max row sum as lmax estimate, set lmin = lmax / 3^D
+    // where D = block_dimy (spatial dimension: 1, 2, or 3), clamped to [1,3].
+    // The 3^D factor gives: D=1 -> /3, D=2 -> /9, D=3 -> /27.
+    // This targets the upper (1 - 1/3^D) fraction of the spectrum.
+    {
+        int D = this->m_A->get_block_dimy();
+        if (D < 1) D = 1;
+        if (D > 3) D = 3;
+        ValueTypeB denom = (ValueTypeB)1.0;
+        for (int d = 0; d < D; d++)
+            denom *= (ValueTypeB)3.0;
+        m_lmin_denom = denom;
+    }
+
     if (m_lambda_mode < 2)
     {
         if (!no_preconditioner)
@@ -178,7 +191,7 @@ Chebyshev_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
         }
         else
         {
-            this->m_lmin = this->m_lmax * 0.125;
+            this->m_lmin = this->m_lmax / m_lmin_denom;
         }
     }
     else if (m_lambda_mode == 2)
@@ -187,13 +200,13 @@ Chebyshev_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
         {
             Matrix<T_Config> *pA = dynamic_cast< Matrix<T_Config>* > (this->m_A);
             compute_eigenmax_estimate(*pA, this->m_lmax);
-            this->m_lmin = this->m_lmax * 0.125;
+            this->m_lmin = this->m_lmax / m_lmin_denom;
         }
         else
         {
             // assuming that this preconditioner would be good enough to reduce spectrum to the largest eigen value = 1.0
             this->m_lmax = 0.9;
-            this->m_lmin = this->m_lmax * 0.125;
+            this->m_lmin = this->m_lmax / m_lmin_denom;
         }
     }
     else if (m_lambda_mode == 3)
@@ -202,7 +215,7 @@ Chebyshev_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
         {
             Matrix<T_Config> *pA = dynamic_cast< Matrix<T_Config>* > (this->m_A);
             compute_eigenmax_estimate(*pA, this->m_lmax);
-            this->m_lmin = this->m_lmax * 0.125;
+            this->m_lmin = this->m_lmax / m_lmin_denom;
         }
         else
         {
@@ -215,6 +228,9 @@ Chebyshev_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
     {
         FatalError("Not supported chebyshev_lambda_estimate_mode.", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
     }
+
+    printf("[Chebyshev] lambda_mode=%d  lmax=%.6g  lmin=%.6g  lmin_denom=%.6g\n",
+           m_lambda_mode, (double)this->m_lmax, (double)this->m_lmin, (double)m_lmin_denom);
 
     // Allocate memory needed for iterating.
     m_p.resize( this->m_buffer_N );
