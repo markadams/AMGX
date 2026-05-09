@@ -11,7 +11,7 @@
                 "solver": "BLOCK_JACOBI",
                 "max_iters": 1
             },
-            "chebyshev_polynomial_order": 1,
+            "chebyshev_polynomial_order": 2,
             "chebyshev_lambda_estimate_mode": 4,
             "chebyshev_lmin_denom": 10.0,
             "scope": "cheby",
@@ -29,7 +29,7 @@
         "scope": "main",
         "max_levels": 20,
         "postsweeps": 1,
-        "tolerance": 1e-08,
+        "tolerance": 1e-05,
         "norm": "L2",
         "cycle": "V"
     }
