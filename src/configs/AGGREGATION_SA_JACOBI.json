@@ -13,7 +13,7 @@
         "coarsest_sweeps": 6,
         "max_iters": 100,
         "monitor_residual": 1,
-        "min_coarse_rows": 32,
+        "min_coarse_rows": 25,
         "relaxation_factor": 0.75,
         "scope": "main",
         "max_levels": 20,

@@ -26,6 +26,58 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 
 ---
 
+## SA Verification Tests
+
+Run these on an interactive GPU node (`salloc -N1 -C gpu --gpus=1 -A m4267_g --qos=debug -t 30:00`).
+
+### Standard test: 100×100 2D Poisson
+
+```bash
+cd ~/amgx-sa
+export LD_LIBRARY_PATH=~/amgx-sa/build_perlmutter:$LD_LIBRARY_PATH
+
+# SA + Chebyshev smoother (best convergence)
+./build_perlmutter/test_sa_phase1 -m 100 -n 100 -c src/configs/AGGREGATION_SA_CHEBY.json
+
+# SA + Jacobi smoother
+./build_perlmutter/test_sa_phase1 -m 100 -n 100 -c src/configs/AGGREGATION_SA_JACOBI.json
+```
+
+### Expected output (with min_coarse_rows=25, SIZE_8 selector)
+
+Look for `[SA-VIEW]` lines and `Number of Levels`:
+
+```
+[SA-VIEW] Level 0: #eqs=10000  avg_nnz/row=4.9
+[SA-VIEW] Level 0: rho(D^{-1}A)=...  omega=...
+[SA-VIEW] Level 1: #eqs=1411   avg_nnz/row=...
+[SA-VIEW] Level 2: #eqs=185    avg_nnz/row=...
+Number of Levels: 4
+```
+
+4 levels expected: 10000 → ~1411 → ~185 → ~26 (coarsest < 25 = 5^D, D=2).
+
+### Reference: PETSc GAMG (local, no GPU)
+
+```bash
+# On local machine (PETSC_ARCH=arch-macosx-gnu-O):
+cd ~/Codes/petsc/src/ksp/ksp/tutorials
+./ex2 -m 100 -n 100 -ksp_type richardson -pc_type gamg \
+      -pc_gamg_aggressive_coarsening 0 \
+      -ksp_monitor -ksp_view
+```
+
+PETSc GAMG reference: 4 levels (10000→3683→519→38), ~11 iterations,
+asymptotic rate ~0.31.
+
+### Convergence rate check
+
+In the AMGX output, look for the per-iteration residual norms and compute
+the asymptotic ratio `r_{k+1}/r_k` over the last few iterations.
+Target: rate < 0.5 with SA+Chebyshev on 4 levels.
+
+---
+
 ## Test
 
 ```bash
@@ -51,8 +103,8 @@ Test matrix: `build_perlmutter/poisson2d_amgx.mtx` (100×100 2D Poisson)
 | `src/aggregation/near_null_space.cu` | Near-null space storage and propagation |
 | `include/aggregation/batched_qr.h` | Header for batched QR |
 | `include/aggregation/near_null_space.h` | Header for near-null space |
-| `src/configs/AGGREGATION_SA_JACOBI.json` | SA config: Jacobi smoother |
-| `src/configs/AGGREGATION_SA_CHEBY.json` | SA config: Chebyshev smoother |
+| `src/configs/AGGREGATION_SA_JACOBI.json` | SA config: Jacobi smoother, min_coarse_rows=25 |
+| `src/configs/AGGREGATION_SA_CHEBY.json` | SA config: Chebyshev smoother, min_coarse_rows=25 |
 
 ### SA Path in `createCoarseMatrices()`
 
@@ -74,6 +126,25 @@ The SA path is gated by `m_null_dim > 0` (near-null space set) and
 
 4. **Galerkin product** — `Ac = P^T A P` via
    `CSR_Multiply::csr_galerkin_product`.
+
+5. **Near-null space propagation** — after the Galerkin product, the coarse
+   near-null space (R factors from QR) is propagated to the next level via
+   `next_agg->setNearNullSpace(m_null_dim, coarse_dofs, ...)`. This enables
+   SA on all coarse levels.
+
+### `[SA-VIEW]` Diagnostics
+
+Two permanent (non-debug) printfs in `aggregation_amg_level.cu`:
+
+1. After Galerkin product — prints per-level `#eqs` and `avg_nnz/row`
+2. In `estimateSADampingFactor()` — prints `rho(D^{-1}A)` and `omega`
+
+### Coarsening Control
+
+`min_coarse_rows` in the JSON config controls when coarsening stops.
+Set to `5^D` where D is the problem dimension (25 for 2D, 125 for 3D).
+With SIZE_8 selector (~7× coarsening ratio per level):
+- 10000 → 1411 → 185 → ~26 (stops: 26 < 25 would be next, so 4 levels)
 
 ### Fixed Bugs
 
@@ -99,7 +170,7 @@ The SA path is gated by `m_null_dim > 0` (near-null space set) and
 
 ## Remaining Work
 
-- [ ] Multi-level coarsening (currently only 2 levels for the test problem)
+- [ ] Verify 4-level hierarchy with min_coarse_rows=25
 - [ ] Test with SIZE_4 selector
 - [ ] Block-size > 1 support in `smoothProlongator()`
 - [ ] Adaptive SA (multiple near-null vectors via randomized eigenvectors)
