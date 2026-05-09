@@ -434,6 +434,49 @@ static const char *CHEBY2_JACOBI_SA_LM2_CONFIG =
     "  }"
     "}";
 // -----------------------------------------------------------------------
+// SA Cheby-2+Jacobi, lambda_mode=4: reuse SA rho(D^{-1}A) estimate.
+// lmin = lmax / 10 (matching PETSc GAMG).  min_coarse_rows=25.
+// This is the primary verification config matching PETSc GAMG defaults.
+// -----------------------------------------------------------------------
+static const char *CHEBY2_JACOBI_SA_LM4_CONFIG =
+    "{"
+    "  \"config_version\": 2,"
+    "  \"solver\": {"
+    "    \"algorithm\": \"AGGREGATION\","
+    "    \"solver\": \"AMG\","
+    "    \"smoother\": {"
+    "      \"solver\": \"CHEBYSHEV\","
+    "      \"preconditioner\": {"
+    "        \"solver\": \"BLOCK_JACOBI\","
+    "        \"max_iters\": 1"
+    "      },"
+    "      \"max_iters\": 1,"
+    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_lambda_estimate_mode\": 4,"
+    "      \"chebyshev_lmin_denom\": 10.0,"
+    "      \"monitor_residual\": 0,"
+    "      \"print_solve_stats\": 0"
+    "    },"
+    "    \"presweeps\": 1,"
+    "    \"postsweeps\": 1,"
+    "    \"selector\": \"SIZE_8\","
+    "    \"coarse_solver\": \"JACOBI_L1\","
+    "    \"coarsest_sweeps\": 20,"
+    "    \"max_iters\": 100,"
+    "    \"convergence\": \"RELATIVE_INI\","
+    "    \"tolerance\": 1e-5,"
+    "    \"norm\": \"L2\","
+    "    \"cycle\": \"V\","
+    "    \"min_coarse_rows\": 25,"
+    "    \"max_levels\": 20,"
+    "    \"print_solve_stats\": 1,"
+    "    \"print_grid_stats\": 1,"
+    "    \"monitor_residual\": 1,"
+    "    \"obtain_timings\": 0"
+    "  }"
+    "}";
+
+// -----------------------------------------------------------------------
 // Run one solve using AMGX_read_system to load the matrix from file.
 // If null_dim > 0, call set_near_null_space before setup.
 // -----------------------------------------------------------------------
@@ -526,9 +569,10 @@ int main(int argc, char **argv)
     run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_DENSE_LU_CONFIG, 1);
 
 
-    // Chebyshev order-2 + Jacobi: per-level eigenvalue estimation (lambda_mode=1,2)
+    // Chebyshev order-2 + Jacobi: per-level eigenvalue estimation (lambda_mode=1,2,4)
     run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM1 (Lanczos)",  matrix_file, CHEBY2_JACOBI_SA_LM1_CONFIG, 1);
     run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM2 (row-sum)",  matrix_file, CHEBY2_JACOBI_SA_LM2_CONFIG, 1);
+    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM4 (SA rho)",   matrix_file, CHEBY2_JACOBI_SA_LM4_CONFIG, 1);
     AMGX_finalize_plugins();
     AMGX_finalize();
     return 0;
