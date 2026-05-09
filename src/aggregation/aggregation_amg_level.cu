@@ -3511,7 +3511,7 @@ void Aggregation_AMG_Level_Base<T_Config>::smoothProlongator()
             const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
             thrust_wrapper::fill<TConfig::memSpace>(
                 S.row_offsets.begin(), S.row_offsets.end(),
-                types::util<IndexType>::get_zero());
+                (IndexType)0);
             build_SA_smoother_block_rowlen_kernel<IndexType><<<blocks, threads>>>(
                 num_rows, block_size,
                 A.row_offsets.raw(),
@@ -3524,12 +3524,16 @@ void Aggregation_AMG_Level_Base<T_Config>::smoothProlongator()
         cudaCheckError();
 
         // Step 2: fill col_indices and values
+        // A.values and S.values are ValueTypeA (MatPrec), so use that type.
         {
+            typedef ValueTypeA MatValueType;
+            typedef typename types::PODTypes<MatValueType>::type PodA;
+            PodA omega_pod_a = static_cast<PodA>(omega_pod);
             const int threads = 256;
             const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
-            build_SA_smoother_block_kernel<IndexType, ValueTypeB, PodB><<<blocks, threads>>>(
+            build_SA_smoother_block_kernel<IndexType, MatValueType, PodA><<<blocks, threads>>>(
                 num_rows, block_size,
-                omega_pod,
+                omega_pod_a,
                 A.row_offsets.raw(),
                 A.col_indices.raw(),
                 A.values.raw(),
