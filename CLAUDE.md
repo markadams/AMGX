@@ -103,7 +103,7 @@ For each level, compare:
 | λ_max estimate | CG-based rho(D⁻¹A) | SA power iteration rho(D⁻¹A) |
 | λ_max scaling | ×1.1 | ×1.1 (lambda_mode=4) |
 | λ_min | λ_max_provided × 0.1 | lmax / lmin_denom (=10) |
-| Coarse solver | LU | 6 sweeps (coarsest_sweeps=6) |
+| Coarse solver | LU | DENSE_LU_SOLVER |
 
 ### Diagnostic output to check
 
@@ -262,11 +262,73 @@ With SIZE_8 selector (~7× coarsening ratio per level):
 - Galerkin check `‖Ac − PᵀAP‖_F / ‖Ac‖_F` = 2.6e-16 (machine precision)
 - SA convergence rate: 0.69–0.73 (PETSc GAMG reference: ~0.32 with 4 levels)
 
+### Verified Results (200×200 2D Poisson, Perlmutter)
+
+Test binary: `~/amgx-sa/build_perlmutter/test_sa_phase1`
+Matrix: `~/amgx-sa/build_perlmutter/poisson2d_200.mtx` (40000 DOFs)
+Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solver
+
+#### PETSc GAMG reference (aggressive_coarsening=1, rtol=1e-5)
+
+| Level | #equations | rho(D⁻¹A) |
+|-------|-----------|-----------|
+| 0 (finest) | 40000 | 1.974 |
+| 1 | 5602 | 1.436 |
+| 2 | 976 | 1.634 |
+| 3 | 98 | 1.649 |
+| 4 (coarsest) | 9 | — (LU) |
+
+- **14 iterations**, convergence rate ~0.47
+- Grid complexity: 1.167, operator complexity: 1.423
+
+#### AMGX SA LM4, SIZE_8, DENSE_LU coarse (rtol=1e-5)
+
+| Level | #equations | rho(D⁻¹A) | lmax | lmin |
+|-------|-----------|-----------|------|------|
+| 0 (finest) | 40000 | 1.846 | 2.030 | 0.203 |
+| 1 | 5979 | 1.547 | 1.702 | 0.170 |
+| 2 (coarsest) | 774 | — (LU) | — | — |
+
+- **29 iterations**, convergence rate 0.67
+- Grid complexity: 1.169, operator complexity: 1.461
+- Only 3 levels — SIZE_8 coarsens too aggressively, coarsest grid (774 DOFs) is too large for effective LU but too small for further coarsening with min_coarse_rows=25
+
+#### AMGX SA LM4, SIZE_4, DENSE_LU coarse (rtol=1e-5) ✓ Best match
+
+| Level | #equations | rho(D⁻¹A) | lmax | lmin |
+|-------|-----------|-----------|------|------|
+| 0 (finest) | 40000 | 1.846 | 2.030 | 0.203 |
+| 1 | 9317 | 1.573 | 1.730 | 0.173 |
+| 2 | 2204 | 2.038 | 2.242 | 0.224 |
+| 3 | 539 | 2.182 | 2.400 | 0.240 |
+| 4 (coarsest) | 132 | — (LU) | — | — |
+
+- **17 iterations**, convergence rate 0.50
+- Grid complexity: 1.305, operator complexity: 2.469
+- 5 levels (matches PETSc's 5 levels)
+- Convergence rate 0.50 vs PETSc's 0.47 — **excellent agreement**
+
+#### Analysis
+
+SIZE_4 gives the best match to PETSc GAMG:
+- **17 vs 14 iterations** (21% more) — very reasonable given different aggregation algorithms
+- **Rate 0.50 vs 0.47** — close match
+- Remaining differences likely due to:
+  1. Different aggregation patterns (AMGX SIZE_4 vs GAMG MIS-based)
+  2. Higher rho(D⁻¹A) on coarser levels (2.038, 2.182 vs 1.634, 1.649)
+  3. Higher operator complexity (2.47 vs 1.42) — SIZE_4 produces denser coarse operators
+  4. Coarsest grid 132 DOFs vs PETSc's 9 DOFs
+
+The oscillatory convergence with JACOBI_L1 coarse solver (66 iters, rate 0.84) was
+entirely due to inaccurate coarse solve. Switching to DENSE_LU_SOLVER fixed this.
+
 ---
 
 ## Remaining Work
 
-- [ ] Build on Perlmutter and run 200×200 verification (compare vs PETSc GAMG reference above)
-- [ ] Test with SIZE_4 selector
+- [x] Build on Perlmutter and run 200×200 verification (compare vs PETSc GAMG reference)
+- [x] Test with SIZE_4 selector — **best match to PETSc GAMG** (17 iters, rate 0.50)
+- [x] Fix coarse solver: DENSE_LU_SOLVER instead of JACOBI_L1
 - [ ] Test block_size > 1 (elasticity problem)
 - [ ] Adaptive SA (multiple near-null vectors via randomized eigenvectors)
+- [ ] Investigate why SIZE_4 coarse-level rho values are higher than PETSc's
