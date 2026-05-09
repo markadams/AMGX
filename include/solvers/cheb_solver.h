@@ -38,6 +38,7 @@ class Chebyshev_Solver : public Solver<T_Config>
         EigenSolver<T_Config> *m_eigsolver;
 
         virtual void compute_eigenmax_estimate( const Matrix<T_Config> &A, ValueTypeB &lambda );
+        virtual void compute_dinva_eigenmax_estimate( const Matrix<T_Config> &A, ValueTypeB &lambda );
 
     public:
         // Constructor.

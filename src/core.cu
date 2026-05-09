@@ -31,6 +31,7 @@
 #include <solvers/algebraic_multigrid_solver.h>
 #include <solvers/pcgf_solver.h>
 #include <solvers/cheb_solver.h>
+#include <eigensolvers.h>
 #include <solvers/cg_solver.h>
 #include <solvers/pcg_solver.h>
 #include <solvers/idr_solver.h>
@@ -776,6 +777,7 @@ AMGX_ERROR initialize()
         AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
 #undef AMGX_CASE_LINE
         registerParameters();
+        eigensolvers::initialize();
     }
     catch (amgx_exception e)
     {
@@ -797,6 +799,7 @@ void finalize()
     AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
     AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
 #undef AMGX_CASE_LINE
+    eigensolvers::finalize();
     AMG_Config::unregisterParameters( );
 #ifdef AMGX_WITH_MPI
     int mpi_initialized = 0;

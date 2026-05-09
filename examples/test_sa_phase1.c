@@ -264,6 +264,176 @@ static const char *CHEBY_SA_CONFIG =
     "}";
 
 // -----------------------------------------------------------------------
+// SA Cheby-2+Jacobi with JACOBI_L1 coarse solver.
+// Chebyshev order 2, preconditioned by standard Jacobi (BLOCK_JACOBI).
+// Fixed eigenvalue interval [0.2, 2.0] matching GAMG's -pc_gamg_eigenvalues .2,2.
+// -----------------------------------------------------------------------
+static const char *CHEBY2_JACOBI_SA_CONFIG =
+    "{"
+    "  \"config_version\": 2,"
+    "  \"solver\": {"
+    "    \"algorithm\": \"AGGREGATION\","
+    "    \"solver\": \"AMG\","
+    "    \"smoother\": {"
+    "      \"solver\": \"CHEBYSHEV\","
+    "      \"preconditioner\": {"
+    "        \"solver\": \"BLOCK_JACOBI\","
+    "        \"max_iters\": 1"
+    "      },"
+    "      \"max_iters\": 1,"
+    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_lambda_estimate_mode\": 3,"
+    "      \"cheby_max_lambda\": 2.0,"
+    "      \"cheby_min_lambda\": 0.2,"
+    "      \"monitor_residual\": 0,"
+    "      \"print_solve_stats\": 0"
+    "    },"
+    "    \"presweeps\": 1,"
+    "    \"postsweeps\": 1,"
+    "    \"selector\": \"SIZE_8\","
+    "    \"coarse_solver\": \"JACOBI_L1\","
+    "    \"coarsest_sweeps\": 20,"
+    "    \"max_iters\": 20,"
+    "    \"convergence\": \"RELATIVE_INI\","
+    "    \"tolerance\": 1e-8,"
+    "    \"norm\": \"L2\","
+    "    \"cycle\": \"V\","
+    "    \"min_coarse_rows\": 10,"
+    "    \"max_levels\": 20,"
+    "    \"print_solve_stats\": 1,"
+    "    \"print_grid_stats\": 1,"
+    "    \"monitor_residual\": 1,"
+    "    \"obtain_timings\": 0"
+    "  }"
+    "}";
+
+// -----------------------------------------------------------------------
+// SA Cheby-2+Jacobi with DENSE_LU_SOLVER coarse solver (exact coarse solve).
+// Used to verify whether JACOBI_L1 coarse solve is the bottleneck.
+// -----------------------------------------------------------------------
+static const char *CHEBY2_JACOBI_SA_DENSE_LU_CONFIG =
+    "{"
+    "  \"config_version\": 2,"
+    "  \"solver\": {"
+    "    \"algorithm\": \"AGGREGATION\","
+    "    \"solver\": \"AMG\","
+    "    \"smoother\": {"
+    "      \"solver\": \"CHEBYSHEV\","
+    "      \"preconditioner\": {"
+    "        \"solver\": \"BLOCK_JACOBI\","
+    "        \"max_iters\": 1"
+    "      },"
+    "      \"max_iters\": 1,"
+    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_lambda_estimate_mode\": 3,"
+    "      \"cheby_max_lambda\": 2.0,"
+    "      \"cheby_min_lambda\": 0.2,"
+    "      \"monitor_residual\": 0,"
+    "      \"print_solve_stats\": 0"
+    "    },"
+    "    \"presweeps\": 1,"
+    "    \"postsweeps\": 1,"
+    "    \"selector\": \"SIZE_8\","
+    "    \"coarse_solver\": \"DENSE_LU_SOLVER\","
+    "    \"max_iters\": 20,"
+    "    \"convergence\": \"RELATIVE_INI\","
+    "    \"tolerance\": 1e-8,"
+    "    \"norm\": \"L2\","
+    "    \"cycle\": \"V\","
+    "    \"min_coarse_rows\": 10,"
+    "    \"max_levels\": 20,"
+    "    \"print_solve_stats\": 1,"
+    "    \"print_grid_stats\": 1,"
+    "    \"monitor_residual\": 1,"
+    "    \"obtain_timings\": 0"
+    "  }"
+    "}";
+
+
+
+// -----------------------------------------------------------------------
+// SA Cheby-2+Jacobi, lambda_mode=1: Lanczos estimates lmax per level,
+// lmin = lmax / 10 (matching PETSc GAMG's 0.1*lmax lower bound).
+// This tests whether per-level eigenvalue estimation improves convergence.
+// -----------------------------------------------------------------------
+static const char *CHEBY2_JACOBI_SA_LM1_CONFIG =
+    "{"
+    "  \"config_version\": 2,"
+    "  \"solver\": {"
+    "    \"algorithm\": \"AGGREGATION\","
+    "    \"solver\": \"AMG\","
+    "    \"smoother\": {"
+    "      \"solver\": \"CHEBYSHEV\","
+    "      \"preconditioner\": {"
+    "        \"solver\": \"BLOCK_JACOBI\","
+    "        \"max_iters\": 1"
+    "      },"
+    "      \"max_iters\": 1,"
+    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_lambda_estimate_mode\": 1,"
+    "      \"monitor_residual\": 0,"
+    "      \"print_solve_stats\": 0"
+    "    },"
+    "    \"presweeps\": 1,"
+    "    \"postsweeps\": 1,"
+    "    \"selector\": \"SIZE_8\","
+    "    \"coarse_solver\": \"JACOBI_L1\","
+    "    \"coarsest_sweeps\": 20,"
+    "    \"max_iters\": 20,"
+    "    \"convergence\": \"RELATIVE_INI\","
+    "    \"tolerance\": 1e-8,"
+    "    \"norm\": \"L2\","
+    "    \"cycle\": \"V\","
+    "    \"min_coarse_rows\": 10,"
+    "    \"max_levels\": 20,"
+    "    \"print_solve_stats\": 1,"
+    "    \"print_grid_stats\": 1,"
+    "    \"monitor_residual\": 1,"
+    "    \"obtain_timings\": 0"
+    "  }"
+    "}";
+
+// -----------------------------------------------------------------------
+// SA Cheby-2+Jacobi, lambda_mode=2: row-sum estimates lmax per level,
+// lmin = lmax / 10. Cheaper than Lanczos but still per-level adaptive.
+// -----------------------------------------------------------------------
+static const char *CHEBY2_JACOBI_SA_LM2_CONFIG =
+    "{"
+    "  \"config_version\": 2,"
+    "  \"solver\": {"
+    "    \"algorithm\": \"AGGREGATION\","
+    "    \"solver\": \"AMG\","
+    "    \"smoother\": {"
+    "      \"solver\": \"CHEBYSHEV\","
+    "      \"preconditioner\": {"
+    "        \"solver\": \"BLOCK_JACOBI\","
+    "        \"max_iters\": 1"
+    "      },"
+    "      \"max_iters\": 1,"
+    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_lambda_estimate_mode\": 2,"
+    "      \"monitor_residual\": 0,"
+    "      \"print_solve_stats\": 0"
+    "    },"
+    "    \"presweeps\": 1,"
+    "    \"postsweeps\": 1,"
+    "    \"selector\": \"SIZE_8\","
+    "    \"coarse_solver\": \"JACOBI_L1\","
+    "    \"coarsest_sweeps\": 20,"
+    "    \"max_iters\": 20,"
+    "    \"convergence\": \"RELATIVE_INI\","
+    "    \"tolerance\": 1e-8,"
+    "    \"norm\": \"L2\","
+    "    \"cycle\": \"V\","
+    "    \"min_coarse_rows\": 10,"
+    "    \"max_levels\": 20,"
+    "    \"print_solve_stats\": 1,"
+    "    \"print_grid_stats\": 1,"
+    "    \"monitor_residual\": 1,"
+    "    \"obtain_timings\": 0"
+    "  }"
+    "}";
+// -----------------------------------------------------------------------
 // Run one solve using AMGX_read_system to load the matrix from file.
 // If null_dim > 0, call set_near_null_space before setup.
 // -----------------------------------------------------------------------
@@ -344,13 +514,21 @@ int main(int argc, char **argv)
     run_solve("SA AGGREGATION,       Jacobi omega=2/3, JACOBI_L1 coarse", matrix_file, JACOBI_SA_CONFIG, 1);
 
     // Symmetric Gauss-Seidel (SOR omega=1): standard vs SA
-    run_solve("Standard AGGREGATION, sym-GS, DENSE_LU coarse",  matrix_file, SGS_CONFIG,    0);
-    run_solve("SA AGGREGATION,       sym-GS, JACOBI_L1 coarse", matrix_file, SGS_SA_CONFIG, 1);
+    //    run_solve("Standard AGGREGATION, sym-GS, DENSE_LU coarse",  matrix_file, SGS_CONFIG,    0);
+    //    run_solve("SA AGGREGATION,       sym-GS, JACOBI_L1 coarse", matrix_file, SGS_SA_CONFIG, 1);
 
     // Chebyshev order-4 + JACOBI_L1 precond: standard vs SA
     run_solve("Standard AGGREGATION, Chebyshev-4+L1, DENSE_LU coarse",  matrix_file, CHEBY_CONFIG,    0);
     run_solve("SA AGGREGATION,       Chebyshev-4+L1, JACOBI_L1 coarse", matrix_file, CHEBY_SA_CONFIG, 1);
 
+    // Chebyshev order-2 + standard Jacobi: JACOBI_L1 vs DENSE_LU coarse
+    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, JACOBI_L1 coarse", matrix_file, CHEBY2_JACOBI_SA_CONFIG,         1);
+    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_DENSE_LU_CONFIG, 1);
+
+
+    // Chebyshev order-2 + Jacobi: per-level eigenvalue estimation (lambda_mode=1,2)
+    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM1 (Lanczos)",  matrix_file, CHEBY2_JACOBI_SA_LM1_CONFIG, 1);
+    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM2 (row-sum)",  matrix_file, CHEBY2_JACOBI_SA_LM2_CONFIG, 1);
     AMGX_finalize_plugins();
     AMGX_finalize();
     return 0;

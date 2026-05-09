@@ -41,6 +41,57 @@ void getLambdaEstimate(const IndexType *row_offsets, const IndexType *column_ind
     out[blockDim.x * blockIdx.x + threadIdx.x] = max_sum;
 }
 
+/* Estimate rho(D^{-1}A) via max row-sum of |D^{-1}A|.
+ * For in-band storage (diag=false) the diagonal entry is the one where
+ * column_indices[j] == row_id; we find it by scanning the row.
+ * For external-diagonal storage (diag=true) the diagonal is at dia_indices[row_id].
+ */
+template<typename IndexType, typename ValueTypeA, typename ValueTypeB, int threads_per_block, int warps_per_block, bool diag>
+__global__
+void getDInvALambdaEstimate(const IndexType *row_offsets, const IndexType *column_indices, const ValueTypeA *values, const IndexType *dia_indices, const int num_rows, ValueTypeB *out)
+{
+    int row_id = blockDim.x * blockIdx.x + threadIdx.x;
+    ValueTypeB max_sum = (ValueTypeB)0.0;
+
+    while (row_id < num_rows)
+    {
+        ValueTypeB d_inv = (ValueTypeB)0.0;
+
+        if (diag)
+        {
+            ValueTypeB d = abs(values[dia_indices[row_id]]);
+            d_inv = (d > (ValueTypeB)0.0) ? (ValueTypeB)1.0 / d : (ValueTypeB)0.0;
+        }
+        else
+        {
+            for (int j = row_offsets[row_id]; j < row_offsets[row_id + 1]; j++)
+            {
+                if (column_indices[j] == row_id)
+                {
+                    ValueTypeB d = abs(values[j]);
+                    d_inv = (d > (ValueTypeB)0.0) ? (ValueTypeB)1.0 / d : (ValueTypeB)0.0;
+                    break;
+                }
+            }
+        }
+
+        ValueTypeB cur_sum = (ValueTypeB)0.0;
+
+        for (int j = row_offsets[row_id]; j < row_offsets[row_id + 1]; j++)
+        {
+            cur_sum += abs(values[j]);
+        }
+
+        if (diag)
+            cur_sum += abs(values[dia_indices[row_id]]);
+
+        max_sum = max(max_sum, cur_sum * d_inv);
+        row_id += gridDim.x * blockDim.x;
+    }
+
+    out[blockDim.x * blockIdx.x + threadIdx.x] = max_sum;
+}
+
 // Method to compute the inverse of the diagonal blocks
 template <class T_Config>
 void Chebyshev_Solver<T_Config>::compute_eigenmax_estimate(const Matrix<T_Config> &A, ValueTypeB &lambda)
@@ -66,6 +117,41 @@ void Chebyshev_Solver<T_Config>::compute_eigenmax_estimate(const Matrix<T_Config
     {
         cudaFuncSetCacheConfig(getLambdaEstimate < IndexType, ValueTypeA, ValueTypeB, LAMBDA_BLOCK_SIZE, LAMBDA_BLOCK_SIZE / 32, false >, cudaFuncCachePreferL1);
         getLambdaEstimate < IndexType, ValueTypeA, ValueTypeB, LAMBDA_BLOCK_SIZE, LAMBDA_BLOCK_SIZE / 32, false > <<< num_blocks, threads_per_block>>>
+        (A_row_offsets_ptr, A_column_indices_ptr, A_nonzero_values_ptr, A_dia_idx_ptr, A.get_num_rows(), tsum.raw());
+        cudaCheckError();
+    }
+
+    lambda = *(amgx::thrust::max_element(tsum.begin(), tsum.end()));
+}
+
+/* Estimate rho(D^{-1}A) via max row-sum of |D^{-1}A|.
+ * This is the correct spectral radius estimate for the preconditioned operator
+ * when the preconditioner is block-Jacobi (M = D).  The Chebyshev polynomial
+ * is applied to M^{-1}A, so lmax must bound rho(D^{-1}A), not rho(A).
+ */
+template <class T_Config>
+void Chebyshev_Solver<T_Config>::compute_dinva_eigenmax_estimate(const Matrix<T_Config> &A, ValueTypeB &lambda)
+{
+    VVector tsum(A.get_num_rows());
+    const int threads_per_block = 256;
+    const int blockrows_per_cta = threads_per_block;
+    const int num_blocks = std::min(AMGX_GRID_MAX_SIZE, (int) (A.get_num_rows() - 1) / blockrows_per_cta + 1);
+    const IndexType *A_row_offsets_ptr = A.row_offsets.raw();
+    const IndexType *A_column_indices_ptr = A.col_indices.raw();
+    const IndexType *A_dia_idx_ptr = A.diag.raw();
+    const ValueTypeA *A_nonzero_values_ptr = A.values.raw();
+
+    if (A.hasProps(DIAG))
+    {
+        cudaFuncSetCacheConfig(getDInvALambdaEstimate < IndexType, ValueTypeA, ValueTypeB, LAMBDA_BLOCK_SIZE, LAMBDA_BLOCK_SIZE / 32, true >, cudaFuncCachePreferL1);
+        getDInvALambdaEstimate < IndexType, ValueTypeA, ValueTypeB, LAMBDA_BLOCK_SIZE, LAMBDA_BLOCK_SIZE / 32, true > <<< num_blocks, threads_per_block>>>
+        (A_row_offsets_ptr, A_column_indices_ptr, A_nonzero_values_ptr, A_dia_idx_ptr, A.get_num_rows(), tsum.raw());
+        cudaCheckError();
+    }
+    else
+    {
+        cudaFuncSetCacheConfig(getDInvALambdaEstimate < IndexType, ValueTypeA, ValueTypeB, LAMBDA_BLOCK_SIZE, LAMBDA_BLOCK_SIZE / 32, false >, cudaFuncCachePreferL1);
+        getDInvALambdaEstimate < IndexType, ValueTypeA, ValueTypeB, LAMBDA_BLOCK_SIZE, LAMBDA_BLOCK_SIZE / 32, false > <<< num_blocks, threads_per_block>>>
         (A_row_offsets_ptr, A_column_indices_ptr, A_nonzero_values_ptr, A_dia_idx_ptr, A.get_num_rows(), tsum.raw());
         cudaCheckError();
     }
@@ -106,7 +192,7 @@ Chebyshev_Solver<T_Config>::Chebyshev_Solver( AMG_Config &cfg, const std::string
     }
 
     std::string eig_cfg_string =  "algorithm=AGGREGATION,\n"
-                                  "eig_solver=LANCZOS,\n"
+                                  "eig_solver=POWER_ITERATION,\n"
                                   "verbosity_level=0,\n"
                                   "eig_max_iters=128,\n"
                                   "eig_tolerance=1e-4,\n"
@@ -152,62 +238,104 @@ Chebyshev_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
 
     // m_lambda_mode:
     // 0: use eigensolver to get lmin and lmax estimate
-    // 1: use eigensolver to get lmax estimate, set lmin = lmax / 3^D
-    // 2: use max row sum as lmax estimate, set lmin = lmax / 3^D
-    // where D = block_dimy (spatial dimension: 1, 2, or 3), clamped to [1,3].
-    // The 3^D factor gives: D=1 -> /3, D=2 -> /9, D=3 -> /27.
-    // This targets the upper (1 - 1/3^D) fraction of the spectrum.
-    {
-        int D = this->m_A->get_block_dimy();
-        if (D < 1) D = 1;
-        if (D > 3) D = 3;
-        ValueTypeB denom = (ValueTypeB)1.0;
-        for (int d = 0; d < D; d++)
-            denom *= (ValueTypeB)3.0;
-        m_lmin_denom = denom;
-    }
+    // 1: use eigensolver to get lmax estimate, set lmin = lmax / LMIN_DENOM
+    // 2: use max row sum as lmax estimate, set lmin = lmax / LMIN_DENOM
+    // LMIN_DENOM=10 matches PETSc GAMG which uses lmin = 0.1 * lmax
+    // (GAMG Chebyshev transform [0, 0.1; 0, 1.1] -> lmin = 0.1*lmax).
+    m_lmin_denom = (ValueTypeB)10.0;
 
-    if (m_lambda_mode < 2)
+    if (m_lambda_mode == 0)
     {
-        if (!no_preconditioner)
-        {
-            SolverOperator<T_Config> *MA = new SolverOperator<T_Config> (this->m_A, m_preconditioner);
-            m_eigsolver->setup(*MA);
-            m_eigsolver->solve(eig_solver_t_x);
-            delete MA;
-        }
-        else
+        // lambda_mode=0: use eigensolver to get both lmin and lmax.
+        // The subspace-iteration eigensolver requires a raw Matrix (uses csrmm
+        // internally), so we always run it on the raw matrix.  For the
+        // preconditioned case the caller should use lambda_mode=1 instead.
+        bool eig_ran = false;
+
+        if (mtx_A != NULL)
         {
             m_eigsolver->setup(*mtx_A);
             m_eigsolver->solve(eig_solver_t_x);
+            eig_ran = true;
         }
 
-        const std::vector<ValueTypeB> &lambdas = m_eigsolver->get_eigenvalues();
-        this->m_lmax = lambdas[0] * 1.05;
-
-        if (m_lambda_mode == 0)
+        if (eig_ran)
         {
-            this->m_lmin = lambdas[lambdas.size() - 1] * 0.95;
+            const std::vector<ValueTypeB> &lambdas = m_eigsolver->get_eigenvalues();
+
+            if (!lambdas.empty())
+            {
+                this->m_lmax = lambdas[0] * 1.05;
+                this->m_lmin = lambdas[lambdas.size() - 1] * 0.95;
+            }
+            else
+            {
+                // Eigensolver did not converge; fall back to row-sum estimate.
+                compute_eigenmax_estimate(*mtx_A, this->m_lmax);
+                this->m_lmin = this->m_lmax / m_lmin_denom;
+            }
         }
         else
         {
+            this->m_lmax = 2.0;
             this->m_lmin = this->m_lmax / m_lmin_denom;
         }
     }
-    else if (m_lambda_mode == 2)
+    else if (m_lambda_mode == 1)
     {
-        if (no_preconditioner)
+        // lambda_mode=1: estimate lmax only; lmin = lmax / LMIN_DENOM.
+        // The Chebyshev polynomial is applied to M^{-1}A, so we must estimate
+        // rho(D^{-1}A).  The subspace eigensolver uses csrmm internally and
+        // cannot accept a SolverOperator, so we use the row-sum of |D^{-1}A|
+        // (max_i sum_j |a_ij/d_ii|) when a preconditioner is present.
+        // Without a preconditioner, run the eigensolver on the raw matrix.
+        if (!no_preconditioner && mtx_A != NULL)
         {
-            Matrix<T_Config> *pA = dynamic_cast< Matrix<T_Config>* > (this->m_A);
-            compute_eigenmax_estimate(*pA, this->m_lmax);
-            this->m_lmin = this->m_lmax / m_lmin_denom;
+            compute_dinva_eigenmax_estimate(*mtx_A, this->m_lmax);
+            this->m_lmax *= 1.05;
+        }
+        else if (mtx_A != NULL)
+        {
+            bool eig_ran = false;
+            m_eigsolver->setup(*mtx_A);
+            m_eigsolver->solve(eig_solver_t_x);
+            eig_ran = true;
+
+            const std::vector<ValueTypeB> &lambdas = m_eigsolver->get_eigenvalues();
+
+            if (!lambdas.empty())
+                this->m_lmax = lambdas[0] * 1.05;
+            else
+            {
+                compute_eigenmax_estimate(*mtx_A, this->m_lmax);
+                this->m_lmax *= 1.05;
+            }
         }
         else
         {
-            // assuming that this preconditioner would be good enough to reduce spectrum to the largest eigen value = 1.0
-            this->m_lmax = 0.9;
-            this->m_lmin = this->m_lmax / m_lmin_denom;
+            this->m_lmax = 2.0;
         }
+
+        this->m_lmin = this->m_lmax / m_lmin_denom;
+    }
+    else if (m_lambda_mode == 2)
+    {
+        // lambda_mode=2: row-sum estimate of lmax; lmin = lmax / LMIN_DENOM.
+        // When a preconditioner is present, estimate rho(D^{-1}A) via the
+        // row-sum of |D^{-1}A| instead of using the hardcoded value 0.9.
+        if (mtx_A != NULL)
+        {
+            if (!no_preconditioner)
+                compute_dinva_eigenmax_estimate(*mtx_A, this->m_lmax);
+            else
+                compute_eigenmax_estimate(*mtx_A, this->m_lmax);
+        }
+        else
+        {
+            this->m_lmax = 2.0;
+        }
+
+        this->m_lmin = this->m_lmax / m_lmin_denom;
     }
     else if (m_lambda_mode == 3)
     {

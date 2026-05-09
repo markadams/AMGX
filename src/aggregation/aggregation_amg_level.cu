@@ -2132,6 +2132,15 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
     }
     // --- Dump A, P, Ac to files for Python verification (finest level only) ---
 
+    // [SA-VIEW] Print per-level stats for the fine operator A
+    {
+        int nr  = A.get_num_rows();
+        int nnz = A.get_num_nz();
+        double avg_nnz = (nr > 0) ? (double)nnz / nr : 0.0;
+        printf("[SA-VIEW] Level %d: #eqs=%d  avg_nnz/row=%.1f\n",
+               this->getLevelIndex(), nr, avg_nnz);
+        fflush(stdout);
+    }
     Ac.setColsReorderedByColor(false);
     Ac.setView(FULL);
 
@@ -3153,6 +3162,11 @@ Aggregation_AMG_Level_Base<T_Config>::estimateSADampingFactor(int max_iter)
     }
 
 
+    // [SA-VIEW] Print eigenvalue estimate for this level
+    printf("[SA-VIEW] Level %d: rho(D^{-1}A)=%.4g  omega=%.4g\n",
+           this->getLevelIndex(), (double)lambda_pod,
+           (lambda_pod > (PodB)0.0) ? (double)(1.4 / lambda_pod) : 0.0);
+    fflush(stdout);
     return omega;
 }
 
