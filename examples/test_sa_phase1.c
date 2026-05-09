@@ -435,9 +435,10 @@ static const char *CHEBY2_JACOBI_SA_LM2_CONFIG =
     "}";
 // -----------------------------------------------------------------------
 // SA Cheby-2+Jacobi, lambda_mode=4: reuse SA rho(D^{-1}A) estimate.
-// lmin = lmax / 10 (matching PETSc GAMG).  min_coarse_rows=25.
+// lmin = lmax / 10 (matching PETSc GAMG).  min_coarse_rows=10.
 // DENSE_LU_SOLVER on coarsest grid for exact coarse solve.
 // This is the primary verification config matching PETSc GAMG defaults.
+// min_coarse_rows=10 to allow 5 levels with SIZE_8 (matching GAMG depth).
 // -----------------------------------------------------------------------
 static const char *CHEBY2_JACOBI_SA_LM4_CONFIG =
     "{"
@@ -467,7 +468,7 @@ static const char *CHEBY2_JACOBI_SA_LM4_CONFIG =
     "    \"tolerance\": 1e-5,"
     "    \"norm\": \"L2\","
     "    \"cycle\": \"V\","
-    "    \"min_coarse_rows\": 25,"
+    "    \"min_coarse_rows\": 10,"
     "    \"max_levels\": 20,"
     "    \"print_solve_stats\": 1,"
     "    \"print_grid_stats\": 1,"
