@@ -436,6 +436,7 @@ static const char *CHEBY2_JACOBI_SA_LM2_CONFIG =
 // -----------------------------------------------------------------------
 // SA Cheby-2+Jacobi, lambda_mode=4: reuse SA rho(D^{-1}A) estimate.
 // lmin = lmax / 10 (matching PETSc GAMG).  min_coarse_rows=25.
+// DENSE_LU_SOLVER on coarsest grid for exact coarse solve.
 // This is the primary verification config matching PETSc GAMG defaults.
 // -----------------------------------------------------------------------
 static const char *CHEBY2_JACOBI_SA_LM4_CONFIG =
@@ -460,8 +461,49 @@ static const char *CHEBY2_JACOBI_SA_LM4_CONFIG =
     "    \"presweeps\": 1,"
     "    \"postsweeps\": 1,"
     "    \"selector\": \"SIZE_8\","
-    "    \"coarse_solver\": \"JACOBI_L1\","
-    "    \"coarsest_sweeps\": 20,"
+    "    \"coarse_solver\": \"DENSE_LU_SOLVER\","
+    "    \"max_iters\": 100,"
+    "    \"convergence\": \"RELATIVE_INI\","
+    "    \"tolerance\": 1e-5,"
+    "    \"norm\": \"L2\","
+    "    \"cycle\": \"V\","
+    "    \"min_coarse_rows\": 25,"
+    "    \"max_levels\": 20,"
+    "    \"print_solve_stats\": 1,"
+    "    \"print_grid_stats\": 1,"
+    "    \"monitor_residual\": 1,"
+    "    \"obtain_timings\": 0"
+    "  }"
+    "}";
+
+// -----------------------------------------------------------------------
+// SA Cheby-2+Jacobi, lambda_mode=4, SIZE_4 selector.
+// Same as LM4 above but with SIZE_4 for less aggressive coarsening
+// (closer to PETSc GAMG aggressive_coarsening=1 behavior).
+// -----------------------------------------------------------------------
+static const char *CHEBY2_JACOBI_SA_LM4_SIZE4_CONFIG =
+    "{"
+    "  \"config_version\": 2,"
+    "  \"solver\": {"
+    "    \"algorithm\": \"AGGREGATION\","
+    "    \"solver\": \"AMG\","
+    "    \"smoother\": {"
+    "      \"solver\": \"CHEBYSHEV\","
+    "      \"preconditioner\": {"
+    "        \"solver\": \"BLOCK_JACOBI\","
+    "        \"max_iters\": 1"
+    "      },"
+    "      \"max_iters\": 1,"
+    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_lambda_estimate_mode\": 4,"
+    "      \"chebyshev_lmin_denom\": 10.0,"
+    "      \"monitor_residual\": 0,"
+    "      \"print_solve_stats\": 0"
+    "    },"
+    "    \"presweeps\": 1,"
+    "    \"postsweeps\": 1,"
+    "    \"selector\": \"SIZE_4\","
+    "    \"coarse_solver\": \"DENSE_LU_SOLVER\","
     "    \"max_iters\": 100,"
     "    \"convergence\": \"RELATIVE_INI\","
     "    \"tolerance\": 1e-5,"
@@ -551,28 +593,22 @@ int main(int argc, char **argv)
     AMGX_register_print_callback(&print_callback);
     AMGX_install_signal_handler();
 
-    // Damped Jacobi (omega=2/3): standard vs SA
-    // SA uses JACOBI_L1 coarse solver because P^T A P can be near-singular.
-    run_solve("Standard AGGREGATION, Jacobi omega=2/3, DENSE_LU coarse",  matrix_file, JACOBI_CONFIG,    0);
-    run_solve("SA AGGREGATION,       Jacobi omega=2/3, JACOBI_L1 coarse", matrix_file, JACOBI_SA_CONFIG, 1);
+    // --- Previously verified configs (commented out to save time) ---
+    // run_solve("Standard AGGREGATION, Jacobi omega=2/3, DENSE_LU coarse",  matrix_file, JACOBI_CONFIG,    0);
+    // run_solve("SA AGGREGATION,       Jacobi omega=2/3, JACOBI_L1 coarse", matrix_file, JACOBI_SA_CONFIG, 1);
+    // run_solve("Standard AGGREGATION, Chebyshev-4+L1, DENSE_LU coarse",  matrix_file, CHEBY_CONFIG,    0);
+    // run_solve("SA AGGREGATION,       Chebyshev-4+L1, JACOBI_L1 coarse", matrix_file, CHEBY_SA_CONFIG, 1);
+    // run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, JACOBI_L1 coarse", matrix_file, CHEBY2_JACOBI_SA_CONFIG,         1);
+    // run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_DENSE_LU_CONFIG, 1);
+    // run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM1 (Lanczos)",  matrix_file, CHEBY2_JACOBI_SA_LM1_CONFIG, 1);
+    // run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM2 (row-sum)",  matrix_file, CHEBY2_JACOBI_SA_LM2_CONFIG, 1);
 
-    // Symmetric Gauss-Seidel (SOR omega=1): standard vs SA
-    //    run_solve("Standard AGGREGATION, sym-GS, DENSE_LU coarse",  matrix_file, SGS_CONFIG,    0);
-    //    run_solve("SA AGGREGATION,       sym-GS, JACOBI_L1 coarse", matrix_file, SGS_SA_CONFIG, 1);
+    // --- Active verification tests ---
+    // LM4 (SA rho) with DENSE_LU coarse solver, SIZE_8 selector
+    run_solve("SA Cheby2+Jacobi, LM4, SIZE_8, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_LM4_CONFIG, 1);
 
-    // Chebyshev order-4 + JACOBI_L1 precond: standard vs SA
-    run_solve("Standard AGGREGATION, Chebyshev-4+L1, DENSE_LU coarse",  matrix_file, CHEBY_CONFIG,    0);
-    run_solve("SA AGGREGATION,       Chebyshev-4+L1, JACOBI_L1 coarse", matrix_file, CHEBY_SA_CONFIG, 1);
-
-    // Chebyshev order-2 + standard Jacobi: JACOBI_L1 vs DENSE_LU coarse
-    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, JACOBI_L1 coarse", matrix_file, CHEBY2_JACOBI_SA_CONFIG,         1);
-    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_DENSE_LU_CONFIG, 1);
-
-
-    // Chebyshev order-2 + Jacobi: per-level eigenvalue estimation (lambda_mode=1,2,4)
-    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM1 (Lanczos)",  matrix_file, CHEBY2_JACOBI_SA_LM1_CONFIG, 1);
-    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM2 (row-sum)",  matrix_file, CHEBY2_JACOBI_SA_LM2_CONFIG, 1);
-    run_solve("SA AGGREGATION,       Chebyshev-2+Jacobi, LM4 (SA rho)",   matrix_file, CHEBY2_JACOBI_SA_LM4_CONFIG, 1);
+    // LM4 (SA rho) with DENSE_LU coarse solver, SIZE_4 selector
+    run_solve("SA Cheby2+Jacobi, LM4, SIZE_4, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_LM4_SIZE4_CONFIG, 1);
     AMGX_finalize_plugins();
     AMGX_finalize();
     return 0;
