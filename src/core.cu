@@ -407,10 +407,15 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("kpz_mu", "the constant mu used in the KPZ polynomial smoother", 4);
     AMG_Config::registerParameter<int>("kpz_order", "the order of the KPZ polynomial smoother", 3);
     //Chebyshev polynomial smoother
-    AMG_Config::registerParameter<int>("chebyshev_polynomial_order", "the order of the KPZ polynomial smoother", 5);
-    AMG_Config::registerParameter<int>("chebyshev_lambda_estimate_mode", "the order of the KPZ polynomial smoother", 0, 0, 2);
+    AMG_Config::registerParameter<int>("chebyshev_polynomial_order", "the order of the Chebyshev polynomial smoother", 5);
+    // lambda_mode: 0=eigensolver(lmin+lmax), 1=eigensolver(lmax only), 2=row-sum(lmax),
+    //              3=user-provided, 4=reuse SA rho(D^{-1}A) estimate
+    AMG_Config::registerParameter<int>("chebyshev_lambda_estimate_mode", "eigenvalue estimate mode for Chebyshev smoother (0-4)", 0, 0, 4);
     AMG_Config::registerParameter<double>("cheby_max_lambda", "User guess at maximum eigenvalue of preconditioned operator", 1.0, 0.0, 1.0e20);
     AMG_Config::registerParameter<double>("cheby_min_lambda", "User guess at minimum eigenvalue of preconditioned operator", 0.125, 0.0, 1.0e20);
+    // lmin = lmax / chebyshev_lmin_denom.  PETSc GAMG uses 10.0 (lmin=0.1*lmax).
+    // For D-dimensional elasticity some references use D^3 (8 for 2D, 27 for 3D).
+    AMG_Config::registerParameter<double>("chebyshev_lmin_denom", "lmin = lmax / chebyshev_lmin_denom for Chebyshev smoother", 10.0, 1.0, 1.0e6);
     //Kaczmarz
     AMG_Config::registerParameter<int>("kaczmarz_coloring_needed", "Enforces MC Kaczmarz (0 for naive single warp implementation)", 1);
     //CF-Jacobi smoother

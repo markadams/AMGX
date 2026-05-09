@@ -163,16 +163,17 @@ void Chebyshev_Solver<T_Config>::compute_dinva_eigenmax_estimate(const Matrix<T_
 template< class T_Config>
 Chebyshev_Solver<T_Config>::Chebyshev_Solver( AMG_Config &cfg, const std::string &cfg_scope) :
     Solver<T_Config>( cfg, cfg_scope),
-    m_buffer_N(0), m_eigsolver(NULL)
+    m_buffer_N(0), m_eigsolver(NULL), m_sa_eig_set(false), m_sa_lmax(0.0)
 {
     std::string solverName, new_scope, tmp_scope;
     cfg.getParameter<std::string>( "preconditioner", solverName, cfg_scope, new_scope );
     m_lambda_mode = cfg.AMG_Config::template getParameter<int>("chebyshev_lambda_estimate_mode", cfg_scope);
     m_cheby_order = cfg.AMG_Config::template getParameter<int>("chebyshev_polynomial_order", cfg_scope);
     // 0 - use eigensolver to get BOTH estimates
-    // 1 - use eigensolver to get maximum estimate
-    // 2 - use max sum of abs values as a rough estimate for maximum eigenvalue
+    // 1 - use eigensolver to get maximum estimate (lmin = lmax / lmin_denom)
+    // 2 - use max row-sum of |D^{-1}A| as lmax estimate (lmin = lmax / lmin_denom)
     // 3 - use user provided cheby_max_lambda and cheby_min_lambda
+    // 4 - use SA-computed rho(D^{-1}A) set via setSAEigenvalue() (lmin = lmax / lmin_denom)
 
     if (m_lambda_mode == 3)
     {
@@ -238,11 +239,19 @@ Chebyshev_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
 
     // m_lambda_mode:
     // 0: use eigensolver to get lmin and lmax estimate
-    // 1: use eigensolver to get lmax estimate, set lmin = lmax / LMIN_DENOM
-    // 2: use max row sum as lmax estimate, set lmin = lmax / LMIN_DENOM
-    // LMIN_DENOM=10 matches PETSc GAMG which uses lmin = 0.1 * lmax
-    // (GAMG Chebyshev transform [0, 0.1; 0, 1.1] -> lmin = 0.1*lmax).
-    m_lmin_denom = (ValueTypeB)10.0;
+    // 1: use eigensolver to get lmax estimate, set lmin = lmax / lmin_denom
+    // 2: use max row-sum of |D^{-1}A| as lmax estimate, set lmin = lmax / lmin_denom
+    // 3: use user-provided cheby_max_lambda and cheby_min_lambda
+    // 4: use SA-computed rho(D^{-1}A) (set via setSAEigenvalue()), lmin = lmax / lmin_denom
+    //
+    // chebyshev_lmin_denom (config, default 10.0):
+    //   lmin = lmax / lmin_denom.
+    //   PETSc GAMG uses lmin = 0.1 * lmax (transform [0,0.1;0,1.1]), so lmin_denom=10.
+    //   For D-dimensional problems some references use lmin_denom = D^3 (8 for 2D, 27 for 3D).
+    {
+        double denom_d = this->m_cfg->template getParameter<double>("chebyshev_lmin_denom", this->m_cfg_scope);
+        m_lmin_denom = static_cast<ValueTypeB>(denom_d);
+    }
 
     if (m_lambda_mode == 0)
     {
@@ -352,13 +361,45 @@ Chebyshev_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
             this->m_lmin = this->m_user_min_lambda;
         }
     }
+    else if (m_lambda_mode == 4)
+    {
+        // lambda_mode=4: reuse the SA-computed rho(D^{-1}A) estimate.
+        // The SA prolongator smoother already computed rho(D^{-1}A) via power
+        // iteration.  The aggregation level stores it and calls setSAEigenvalue()
+        // before solver_setup().  This avoids a redundant eigenvalue computation
+        // and matches PETSc GAMG's -pc_gamg_use_sa_esteig behaviour.
+        if (m_sa_eig_set)
+        {
+            this->m_lmax = static_cast<ValueTypeB>(m_sa_lmax) * static_cast<ValueTypeB>(1.1);
+        }
+        else
+        {
+            // SA estimate not available (e.g. coarse levels or non-SA path):
+            // fall back to row-sum estimate.
+            if (mtx_A != NULL)
+            {
+                if (!no_preconditioner)
+                    compute_dinva_eigenmax_estimate(*mtx_A, this->m_lmax);
+                else
+                    compute_eigenmax_estimate(*mtx_A, this->m_lmax);
+                this->m_lmax *= 1.05;
+            }
+            else
+            {
+                this->m_lmax = 2.0;
+            }
+        }
+        this->m_lmin = this->m_lmax / m_lmin_denom;
+    }
     else
     {
         FatalError("Not supported chebyshev_lambda_estimate_mode.", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
     }
 
-    printf("[Chebyshev] lambda_mode=%d  lmax=%.6g  lmin=%.6g  lmin_denom=%.6g\n",
-           m_lambda_mode, (double)this->m_lmax, (double)this->m_lmin, (double)m_lmin_denom);
+    printf("[Chebyshev] level=%d  lambda_mode=%d  lmax=%.6g  lmin=%.6g  lmin_denom=%.6g  sa_eig_set=%d\n",
+           this->m_A ? (int)this->m_A->get_num_rows() : -1,
+           m_lambda_mode, (double)this->m_lmax, (double)this->m_lmin,
+           (double)m_lmin_denom, (int)m_sa_eig_set);
 
     // Allocate memory needed for iterating.
     m_p.resize( this->m_buffer_N );

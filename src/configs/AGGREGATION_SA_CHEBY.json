@@ -6,9 +6,14 @@
         "obtain_timings": 1,
         "solver": "AMG",
         "smoother": {
-            "solver": "CHEBYSHEV_POLY",
-            "preconditioner": "NOSOLVER",
-            "chebyshev_polynomial_order": 3,
+            "solver": "CHEBYSHEV",
+            "preconditioner": {
+                "solver": "BLOCK_JACOBI",
+                "max_iters": 1
+            },
+            "chebyshev_polynomial_order": 1,
+            "chebyshev_lambda_estimate_mode": 4,
+            "chebyshev_lmin_denom": 10.0,
             "scope": "cheby",
             "monitor_residual": 0,
             "print_solve_stats": 0

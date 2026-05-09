@@ -5,6 +5,7 @@
 #include <aggregation/aggregation_amg_level.h>
 #include <aggregation/batched_qr.h>
 #include <matrix_analysis.h>
+#include <solvers/cheb_solver.h>
 
 #ifdef _WIN32
 #pragma warning (push)
@@ -2083,6 +2084,22 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
         }
         buildTentativeProlongator();
         smoothProlongator();
+
+        // Pass the SA-computed rho(D^{-1}A) to the Chebyshev smoother so that
+        // lambda_mode=4 can reuse it instead of running a separate power iteration.
+        // Must be done before setup_smoother() is called (which calls solver_setup()).
+        if (m_sa_rho > 0.0)
+        {
+            Solver<TConfig> *sm = this->getSmoother();
+            if (sm != nullptr)
+            {
+                Chebyshev_Solver<TConfig> *cheb =
+                    dynamic_cast<Chebyshev_Solver<TConfig>*>(sm);
+                if (cheb != nullptr)
+                    cheb->setSAEigenvalue(m_sa_rho);
+            }
+        }
+
         // Compute and store P^T for use in restrictResidual()
         transpose(m_P_tent, m_P_tent_T);
 
@@ -3303,11 +3320,119 @@ void build_SA_smoother_kernel(
 }
 
 // ---------------------------------------------------------------
+// Kernel: build scalar S row offsets from block-CSR A (block_size > 1)
+//
+// Each block-row i of A (with block_size x block_size blocks) expands
+// to block_size scalar rows.  Each block-nonzero expands to block_size
+// scalar columns.  So scalar row (i*bs + li) has
+//   (row_offsets[i+1] - row_offsets[i]) * block_size  entries.
+//
+// This kernel fills S_row_offsets[0..num_dofs] (exclusive scan input):
+//   S_row_offsets[i*bs + li] = (row_offsets[i+1]-row_offsets[i]) * bs
+// Then an exclusive scan converts it to actual offsets.
+// ---------------------------------------------------------------
+template <typename IndexType>
+__global__
+void build_SA_smoother_block_rowlen_kernel(
+    int num_block_rows,
+    int block_size,
+    const IndexType * __restrict__ A_row_offsets,
+    IndexType * __restrict__ S_row_offsets)   // length num_dofs+1, pre-zeroed
+{
+    int num_dofs = num_block_rows * block_size;
+    for (int dof = blockDim.x * blockIdx.x + threadIdx.x;
+         dof < num_dofs;
+         dof += gridDim.x * blockDim.x)
+    {
+        int node = dof / block_size;
+        int row_len = A_row_offsets[node + 1] - A_row_offsets[node];
+        S_row_offsets[dof] = row_len * block_size;
+    }
+    // Sentinel: last entry set to 0 (will be filled by exclusive_scan)
+    if (blockDim.x * blockIdx.x + threadIdx.x == 0)
+        S_row_offsets[num_dofs] = 0;
+}
+
+// ---------------------------------------------------------------
+// Kernel: fill scalar S col_indices and values from block-CSR A
+//
+// For scalar row dof = node*bs + li:
+//   The block-nonzeros of A for block-row `node` are at
+//   A_row_offsets[node] .. A_row_offsets[node+1]-1.
+//   For each block-nz at position `bnz` (block column `node_j = A_col_indices[bnz]`):
+//     scalar columns: node_j*bs + lj  for lj in [0, bs)
+//     scalar value:   A_values[bnz*bs*bs + li*bs + lj]
+//     S value:        delta(dof, node_j*bs+lj) - omega * inv_d_li * a_ij
+//   where inv_d_li = 1 / A_values[A_diag[node]*bs*bs + li*bs + li]
+//
+// S_row_offsets must already be the exclusive-scan result.
+// ---------------------------------------------------------------
+template <typename IndexType, typename ValueType, typename PodType>
+__global__
+void build_SA_smoother_block_kernel(
+    int num_block_rows,
+    int block_size,
+    PodType omega,
+    const IndexType * __restrict__ A_row_offsets,
+    const IndexType * __restrict__ A_col_indices,
+    const ValueType * __restrict__ A_values,
+    const IndexType * __restrict__ A_diag,
+    const IndexType * __restrict__ S_row_offsets,
+    IndexType * __restrict__ S_col_indices,
+    ValueType * __restrict__ S_values)
+{
+    int num_dofs = num_block_rows * block_size;
+    ValueType omega_v = types::util<ValueType>::get_one();
+    omega_v = omega_v * omega;
+
+    for (int dof = blockDim.x * blockIdx.x + threadIdx.x;
+         dof < num_dofs;
+         dof += gridDim.x * blockDim.x)
+    {
+        int node = dof / block_size;
+        int li   = dof % block_size;
+
+        // Point diagonal: A[node,node][li,li]
+        IndexType diag_bnz = A_diag[node];
+        ValueType d_li = A_values[diag_bnz * block_size * block_size + li * block_size + li];
+        ValueType inv_d = types::util<ValueType>::is_zero(d_li)
+                          ? types::util<ValueType>::get_zero()
+                          : types::util<ValueType>::get_one() / d_li;
+
+        int s_pos = S_row_offsets[dof];  // write position in S arrays
+
+        int a_start = A_row_offsets[node];
+        int a_end   = A_row_offsets[node + 1];
+
+        for (int bnz = a_start; bnz < a_end; ++bnz)
+        {
+            int node_j = A_col_indices[bnz];
+            for (int lj = 0; lj < block_size; ++lj)
+            {
+                int col_dof = node_j * block_size + lj;
+                ValueType a_ij = A_values[bnz * block_size * block_size + li * block_size + lj];
+                ValueType s_ij = types::util<ValueType>::get_zero() - omega_v * inv_d * a_ij;
+                if (col_dof == dof)
+                    s_ij = s_ij + types::util<ValueType>::get_one();
+                S_col_indices[s_pos] = col_dof;
+                S_values[s_pos]      = s_ij;
+                ++s_pos;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // smoothProlongator
 // ---------------------------------------------------------------
 //
 // Smooths the tentative prolongator m_P_tent in-place using
-// pattern-preserving SA:  P = (I - omega * D^{-1} * A) * P_tent
+// SA:  P = (I - omega * D^{-1} * A) * P_tent
+//
+// For block_size == 1: S has the same sparsity as A (scalar CSR).
+// For block_size > 1:  S is the scalar expansion of the block-CSR A.
+//   Each block-row i expands to block_size scalar rows; each block-nz
+//   expands to block_size scalar columns.
 //
 // After this call, m_P_tent.values contains the smoothed prolongator
 // values.  The sparsity pattern (row_offsets, col_indices) is unchanged.
@@ -3321,59 +3446,102 @@ void Aggregation_AMG_Level_Base<T_Config>::smoothProlongator()
     Matrix<TConfig> &A = this->getA();
     int block_size     = A.get_block_dimy();
     int num_rows       = A.get_num_rows();   // node-level rows
+    int num_dofs       = num_rows * block_size;
 
     // Estimate damping factor omega = 1.4 / rho(D^{-1}A)
     ValueTypeB omega_b = estimateSADampingFactor();
     typedef typename types::PODTypes<ValueTypeB>::type PodB;
     PodB omega_pod = types::util<ValueTypeB>::abs(omega_b);
 
-
+    // Store rho(D^{-1}A) = 1.4 / omega for use by the Chebyshev smoother (lambda_mode=4).
+    // omega_pod = 1.4 / rho, so rho = 1.4 / omega_pod.
+    if (omega_pod > (PodB)0.0)
+        m_sa_rho = static_cast<double>(1.4 / omega_pod);
+    else
+        m_sa_rho = 0.0;
 
     // ---------------------------------------------------------------
-    // Build S = I - omega * D^{-1} * A  as an explicit CSR matrix.
-    //
-    // For block_size == 1 (scalar): S has the same sparsity as A.
-    //   S[i,j] = -omega / A[i,i] * A[i,j]   for j != i
-    //   S[i,i] = 1 - omega
-    //
-    // For block_size > 1: not yet supported.
+    // Build S = I - omega * D^{-1} * A  as an explicit scalar CSR matrix.
     // ---------------------------------------------------------------
-    if (block_size != 1)
-        FatalError("smoothProlongator: block_size > 1 not yet supported for SA", AMGX_ERR_NOT_IMPLEMENTED);
-
-    // S has the same sparsity as A (scalar CSR, 1x1 blocks)
-    int S_nnz = A.get_num_nz();
     Matrix<TConfig> S;
     S.set_initialized(0);
     S.addProps(CSR);
-    S.resize(num_rows, num_rows, S_nnz, 1, 1, 1);
 
-    // Copy A's sparsity pattern to S
-    thrust_wrapper::copy<TConfig::memSpace>(
-        A.row_offsets.begin(), A.row_offsets.begin() + num_rows + 1,
-        S.row_offsets.begin());
-    thrust_wrapper::copy<TConfig::memSpace>(
-        A.col_indices.begin(), A.col_indices.begin() + S_nnz,
-        S.col_indices.begin());
-    cudaCheckError();
-
-    // Compute S values: S[i,j] = delta(i,j) - omega * A[i,j] / A[i,i]
+    if (block_size == 1)
     {
-        const int threads = 256;
-        const int blocks  = std::min(4096, (num_rows + threads - 1) / threads);
-        build_SA_smoother_kernel<<<blocks, threads>>>(
-            num_rows,
-            omega_pod,
-            A.row_offsets.raw(),
-            A.col_indices.raw(),
-            A.values.raw(),
-            A.diag.raw(),
-            S.values.raw());
+        // S has the same sparsity as A (scalar CSR, 1x1 blocks)
+        int S_nnz = A.get_num_nz();
+        S.resize(num_rows, num_rows, S_nnz, 1, 1, 1);
+
+        // Copy A's sparsity pattern to S
+        thrust_wrapper::copy<TConfig::memSpace>(
+            A.row_offsets.begin(), A.row_offsets.begin() + num_rows + 1,
+            S.row_offsets.begin());
+        thrust_wrapper::copy<TConfig::memSpace>(
+            A.col_indices.begin(), A.col_indices.begin() + S_nnz,
+            S.col_indices.begin());
         cudaCheckError();
+
+        // Compute S values: S[i,j] = delta(i,j) - omega * A[i,j] / A[i,i]
+        {
+            const int threads = 256;
+            const int blocks  = std::min(4096, (num_rows + threads - 1) / threads);
+            build_SA_smoother_kernel<<<blocks, threads>>>(
+                num_rows,
+                omega_pod,
+                A.row_offsets.raw(),
+                A.col_indices.raw(),
+                A.values.raw(),
+                A.diag.raw(),
+                S.values.raw());
+            cudaCheckError();
+        }
+    }
+    else
+    {
+        // block_size > 1: expand block-CSR A to scalar CSR S.
+        // S is num_dofs x num_dofs with S_nnz = A_block_nnz * block_size^2.
+        int A_block_nnz = A.get_num_nz();
+        int S_nnz = A_block_nnz * block_size * block_size;
+        S.resize(num_dofs, num_dofs, S_nnz, 1, 1, 1);
+
+        // Step 1: compute per-scalar-row lengths, then exclusive scan -> S_row_offsets
+        {
+            const int threads = 256;
+            const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
+            thrust_wrapper::fill<TConfig::memSpace>(
+                S.row_offsets.begin(), S.row_offsets.end(),
+                types::util<IndexType>::get_zero());
+            build_SA_smoother_block_rowlen_kernel<IndexType><<<blocks, threads>>>(
+                num_rows, block_size,
+                A.row_offsets.raw(),
+                S.row_offsets.raw());
+            cudaCheckError();
+        }
+        thrust_wrapper::exclusive_scan<TConfig::memSpace>(
+            S.row_offsets.begin(), S.row_offsets.end(),
+            S.row_offsets.begin());
+        cudaCheckError();
+
+        // Step 2: fill col_indices and values
+        {
+            const int threads = 256;
+            const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
+            build_SA_smoother_block_kernel<IndexType, ValueTypeB, PodB><<<blocks, threads>>>(
+                num_rows, block_size,
+                omega_pod,
+                A.row_offsets.raw(),
+                A.col_indices.raw(),
+                A.values.raw(),
+                A.diag.raw(),
+                S.row_offsets.raw(),
+                S.col_indices.raw(),
+                S.values.raw());
+            cudaCheckError();
+        }
     }
 
     S.set_initialized(1);
-
 
     // ---------------------------------------------------------------
     // Compute P_smooth = S * P_tent via SpGEMM
@@ -3381,11 +3549,8 @@ void Aggregation_AMG_Level_Base<T_Config>::smoothProlongator()
     Matrix<TConfig> P_smooth;
     CSR_Multiply<TConfig>::csr_multiply(S, m_P_tent, P_smooth, NULL);
 
-
     // Replace m_P_tent with the smoothed prolongator
     m_P_tent.swap(P_smooth);
-
-
 }
 
 // -------------------------------------------------------------

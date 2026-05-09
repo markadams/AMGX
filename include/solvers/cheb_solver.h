@@ -33,6 +33,10 @@ class Chebyshev_Solver : public Solver<T_Config>
 
         double m_user_max_lambda, m_user_min_lambda;
 
+        // SA eigenvalue reuse: set externally before solver_setup() when lambda_mode==4
+        bool m_sa_eig_set;
+        double m_sa_lmax;
+
         bool no_preconditioner;
         Solver<T_Config> *m_preconditioner;
         EigenSolver<T_Config> *m_eigsolver;
@@ -51,6 +55,10 @@ class Chebyshev_Solver : public Solver<T_Config>
 
         // Setup the solver
         void solver_setup(bool reuse_matrix_structure);
+
+        // Set the SA-computed rho(D^{-1}A) estimate for lambda_mode==4.
+        // Must be called before solver_setup().
+        void setSAEigenvalue(double rho) { m_sa_lmax = rho; m_sa_eig_set = true; }
 
         bool isColoringNeeded() const { if (m_preconditioner != NULL) return m_preconditioner->isColoringNeeded(); return false; }
 

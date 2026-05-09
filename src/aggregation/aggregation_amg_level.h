@@ -64,7 +64,7 @@ class Aggregation_AMG_Level_Base : public AMG_Level<T_Config>
         friend class Aggregation_AMG_Level_Base<TConfig1>;
 
         Aggregation_AMG_Level_Base(AMG_Class *amg, ThreadManager *tmng) : AMG_Level<T_Config>(amg, tmng),
-            m_null_dim(0)
+            m_null_dim(0), m_sa_rho(0.0)
         {
             m_selector = SelectorFactory<T_Config>::allocate(*(amg->m_cfg), amg->m_cfg_scope);
             m_coarseAGenerator = CoarseAGeneratorFactory<T_Config>::allocate(*(amg->m_cfg), amg->m_cfg_scope);
@@ -148,6 +148,11 @@ class Aggregation_AMG_Level_Base : public AMG_Level<T_Config>
         int     m_null_dim;
         VVector m_near_null_space;        // fine-level near-null space (device)
         VVector m_coarse_near_null_space; // coarse-level near-null space (device)
+
+        // SA spectral radius rho(D^{-1}A) computed by estimateSADampingFactor().
+        // Stored here so createCoarseMatrices() can pass it to the Chebyshev
+        // smoother via setSAEigenvalue() before setup_smoother() is called.
+        double m_sa_rho;
 
         // Tentative prolongation operator P_tent (CSR, scalar 1x1 blocks at DOF level).
         // Built by buildTentativeProlongator() from QR factorization of near-null space.
