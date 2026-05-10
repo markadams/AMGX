@@ -592,11 +592,19 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
     {
         const Matrix_d &A_cur = *A_cur_ptr;
         int n_cur     = A_cur.get_num_rows();
+        int nnz_cur_total = A_cur.get_num_nz();
         int total_cur = A_cur.is_matrix_singleGPU() ? n_cur
                                                      : A_cur.manager->num_rows_all();
 
         const int num_blocks_cur = std::min(AMGX_GRID_MAX_SIZE,
                                             (n_cur - 1) / threads_per_block + 1);
+
+        if (effective_k > 1)
+        {
+            amgx_printf("[MIS-k] Pass %d/%d: n_cur=%d, nnz=%d, avg_nnz/row=%.1f\n",
+                        pass, effective_k, n_cur, nnz_cur_total,
+                        (float)nnz_cur_total / (float)n_cur);
+        }
 
         // ----------------------------------------------------------------
         // Phase 1: Assign node weights and run MIS-1 with exchange_halo
@@ -673,6 +681,20 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
             cudaCheckError();
         }
 
+        // Diagnostic: count MIS roots for this pass
+        if (effective_k > 1)
+        {
+            int n_roots_mis = (int)thrust_wrapper::count<AMGX_device>(
+                status_vec.begin(), status_vec.begin() + n_cur, MIS_ROOT);
+            cudaCheckError();
+            amgx_printf("[MIS-k] Pass %d: MIS-1 converged in %d iters, "
+                        "%d roots out of %d nodes (%.1f%%), "
+                        "%d forced-root\n",
+                        pass, icount, n_roots_mis, n_cur,
+                        100.0f * n_roots_mis / n_cur,
+                        num_undecided);
+        }
+
         // ----------------------------------------------------------------
         // Phase 2: Assign non-MIS nodes to nearest MIS root
         // ----------------------------------------------------------------
@@ -741,6 +763,14 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         IVector_d agg_global_cur;
         int n_roots = 0;
         this->renumberAndCountAggregates(agg_cur, agg_global_cur, n_cur, n_roots);
+
+        if (effective_k > 1)
+        {
+            amgx_printf("[MIS-k] Pass %d: %d aggregates from %d nodes "
+                        "(coarsening ratio %.2fx)\n",
+                        pass, n_roots, n_cur,
+                        (float)n_cur / (float)n_roots);
+        }
 
         // ----------------------------------------------------------------
         // Phase 5: Compose R_out_agg
@@ -833,6 +863,15 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
 
             A_cur_ptr            = &A_coarse;
             edge_weights_cur_ptr = &edge_weights_coarse;
+
+            if (effective_k > 1)
+            {
+                int n_coarse = A_coarse.get_num_rows();
+                amgx_printf("[MIS-k] Pass %d: Galerkin coarse matrix: "
+                            "%d rows, %d nnz, avg_nnz/row=%.1f\n",
+                            pass, n_coarse, nnz_coarse,
+                            (float)nnz_coarse / (float)n_coarse);
+            }
         }
     } // end Galerkin loop
 
@@ -846,6 +885,14 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
     // Final renumber to produce contiguous 0..num_aggregates-1
     this->renumberAndCountAggregates(aggregates, aggregates_global,
                                      num_block_rows, num_aggregates);
+
+    if (effective_k > 1)
+    {
+        amgx_printf("[MIS-k] Final: %d fine nodes -> %d aggregates "
+                    "(net coarsening ratio %.2fx)\n",
+                    num_block_rows, num_aggregates,
+                    (float)num_block_rows / (float)num_aggregates);
+    }
 }
 
 // -----------------------------------------------------------------------
