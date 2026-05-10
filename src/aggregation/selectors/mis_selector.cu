@@ -32,6 +32,7 @@
 #include <matrix_analysis.h>
 #include <csr_multiply.h>
 #include <transpose.h>
+#include <texture.h>
 
 #include <thrust/count.h>
 #include <thrust/gather.h>
