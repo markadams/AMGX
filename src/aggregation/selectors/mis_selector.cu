@@ -446,10 +446,12 @@ template<class T_Config>
 MISSelectorBase<T_Config>::MISSelectorBase(AMG_Config &cfg, const std::string &cfg_scope)
 {
     m_mis_k = cfg.AMG_Config::template getParameter<int>("mis_k", cfg_scope);
+    m_aggressive_levels = cfg.AMG_Config::template getParameter<int>("aggressive_levels", cfg_scope);
     m_max_iterations = cfg.AMG_Config::template getParameter<int>("max_matching_iterations", cfg_scope);
     m_merge_singletons = cfg.AMG_Config::template getParameter<int>("merge_singletons", cfg_scope);
     m_weight_formula = cfg.AMG_Config::template getParameter<int>("weight_formula", cfg_scope);
     m_aggregation_edge_weight_component = cfg.AMG_Config::template getParameter<int>("aggregation_edge_weight_component", cfg_scope);
+    m_call_count = 0;
 }
 
 // -----------------------------------------------------------------------
@@ -531,12 +533,28 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
     // distributed manager setup (B2L_maps, halo_offsets, renumbering).
     // ------------------------------------------------------------------
     int effective_k = this->m_mis_k;
+
+    // Per-level aggressive coarsening control:
+    // aggressive_levels=0 means use mis_k on ALL levels (old behavior)
+    // aggressive_levels=N means use mis_k on first N levels, mis_k=1 on rest
+    int current_level = this->m_call_count;
+    this->m_call_count++;
+    if (this->m_aggressive_levels > 0 && current_level >= this->m_aggressive_levels)
+    {
+        effective_k = 1;  // fall back to MIS-1 on non-aggressive levels
+    }
+
     if (!A.is_matrix_singleGPU() && effective_k > 1)
     {
         amgx_printf("WARNING: mis_k=%d not yet supported on multi-GPU, "
                     "falling back to mis_k=1\n", effective_k);
         effective_k = 1;
     }
+
+    amgx_printf("[MIS-k] Level %d: mis_k=%d, effective_k=%d "
+                "(aggressive_levels=%d)\n",
+                current_level, this->m_mis_k, effective_k,
+                this->m_aggressive_levels);
 
     // ------------------------------------------------------------------
     // Initialize composed aggregation: R_out_agg[i] = i (identity)

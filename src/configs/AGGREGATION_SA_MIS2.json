@@ -18,6 +18,7 @@
         "presweeps": 1,
         "selector": "MIS",
         "mis_k": 2,
+        "aggressive_levels": 1,
         "merge_singletons": 1,
         "convergence": "RELATIVE_INI",
         "coarse_solver": "DENSE_LU_SOLVER",

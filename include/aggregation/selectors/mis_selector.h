@@ -33,10 +33,12 @@ class MISSelectorBase : public Selector<T_Config>
                 IVector &aggregates, IVector &aggregates_global, int &num_aggregates) = 0;
 
         int m_mis_k;              // MIS distance parameter (1=standard, 2=aggressive)
+        int m_aggressive_levels;  // Number of levels to use mis_k (0=all, N=first N levels)
         int m_max_iterations;     // Max iterations for MIS convergence loop
         int m_merge_singletons;   // Whether to merge isolated nodes into neighbors
         int m_weight_formula;     // Edge weight formula (0 or 1)
         int m_aggregation_edge_weight_component; // Block component for edge weights
+        int m_call_count;         // Tracks which AMG level we're on (incremented per call)
 };
 
 // Specialization for host

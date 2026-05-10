@@ -723,6 +723,7 @@ int main(int argc, char **argv)
             "    \"postsweeps\": 1,"
             "    \"selector\": \"MIS\","
             "    \"mis_k\": 2,"
+            "    \"aggressive_levels\": 1,"
             "    \"merge_singletons\": 1,"
             "    \"coarse_solver\": \"DENSE_LU_SOLVER\","
             "    \"max_iters\": 100,"
