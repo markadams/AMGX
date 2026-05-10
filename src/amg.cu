@@ -361,8 +361,12 @@ class AMG_Setup
                     }
                 }
 
-                // stop here if next level size is < min_rows
-                if ( nextN <= amg->coarsen_threshold * N && nextN != N && min_partition_rows >= min_rows )
+                // Create coarse level if coarsening ratio is acceptable.
+                // min_coarse_rows is a target: coarsening continues until a grid
+                // falls below the target, but that grid is kept (not thrown away).
+                // The min_partition_rows < min_rows check at the top of the loop
+                // (line ~207) stops further coarsening on the next iteration.
+                if ( nextN <= amg->coarsen_threshold * N && nextN != N )
                 {
                     level->createCoarseMatrices();
                     // Resize coarse vectors.
@@ -728,8 +732,9 @@ class AMG_Setup
                     }
                 }
 
-                // stop here if next level size is < min_rows
-                if ( nextN <= amg->coarsen_threshold * N && nextN != N && min_partition_rows >= min_rows )
+                // Create coarse level if coarsening ratio is acceptable.
+                // min_coarse_rows is a target: the grid that falls below it is kept.
+                if ( nextN <= amg->coarsen_threshold * N && nextN != N )
                 {
                     level->createCoarseMatrices();
                     // Resize coarse vectors.
