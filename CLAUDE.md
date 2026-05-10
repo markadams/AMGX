@@ -336,70 +336,53 @@ ratio per level. Level 1 has 57,872 rows (36% of fine grid) vs MULTI_PAIRWISE's 
 The prolongation/restriction operators from distance-1 aggregates are not smooth enough for
 effective SA coarse-grid correction. Need MIS-2 or MIS-3 for adequate coarsening.
 
-#### AMGX SA, MIS-2 selector (Galerkin loop), DENSE_LU (rtol=1e-5) — Perlmutter, May 10 2026
+#### AMGX SA, MIS-2 selector (aggressive_levels=1), DENSE_LU (rtol=1e-5) — Perlmutter, May 10 2026
 
-MIS-2 Galerkin loop diagnostics:
-```
-[MIS-k] Pass 0/2: n_cur=160000, nnz=798400, avg_nnz/row=5.0
-[MIS-k] Pass 0: MIS-1 converged in 9 iters, 57872 roots (36.2%), 0 forced-root
-[MIS-k] Pass 0: 57872 aggregates from 160000 nodes (coarsening ratio 2.76x)
-[MIS-k] Pass 0: Galerkin coarse matrix: 57872 rows, 350536 nnz, avg_nnz/row=6.1
-[MIS-k] Pass 1/2: n_cur=57872, nnz=350536, avg_nnz/row=6.1
-[MIS-k] Pass 1: MIS-1 converged in 9 iters, 16143 roots (27.9%), 0 forced-root
-[MIS-k] Pass 1: 16143 aggregates from 57872 nodes (coarsening ratio 3.58x)
-[MIS-k] Final: 160000 fine nodes -> 16143 aggregates (net coarsening ratio 9.91x)
-```
+Config: `mis_k=2, aggressive_levels=1` (MIS-2 on level 0, MIS-1 on levels 1+)
 
 | Level | #equations | nnz/row | ρ(D⁻¹A) | λ_max | λ_min |
 |-------|-----------|---------|----------|-------|-------|
 | 0 (finest) | 160,000 | 5.0 | 1.846 | 2.030 | 0.203 |
 | 1 | 16,143 | 11.0 | 1.467 | 1.614 | 0.161 |
-| 2 | 605 | 12.6 | 1.471 | 1.618 | 0.162 |
-| 3 (coarsest) | 24 | — | — | — (LU) | — |
+| 2 | 2,736 | — | — | — | — |
+| 3 | 217 | — | — | — | — |
+| 4 (coarsest) | 17 | — | — | — (LU) | — |
 
-- **DIVERGED** — hit 100-iteration limit, final residual 3,185 (initial 400)
-- Avg convergence rate: **1.0210** (diverging)
-- Grid complexity: 1.105, Operator complexity: 1.232
-- L0→L1 coarsening: **9.91×** (good — matches MULTI_PAIRWISE's 7.83×)
+- **82 iterations**, rate **0.8637** — converges (was diverging without aggressive_levels)
+- Grid complexity: ~1.11, Operator complexity: ~1.24
 
-**Root cause**: The Galerkin-composed MIS-2 aggregates achieve the target coarsening ratio
-(9.91×) and produce low grid/operator complexity (1.105/1.232), but the V-cycle **diverges**.
-The composed aggregates from two MIS-1 passes produce prolongation operators that fail the
-SA approximation property. Possible issues:
-1. **Aggregate shape**: Two-pass MIS-1 composition may produce irregular aggregate shapes
-   (chains of chains) that don't span the near-null space well
-2. **Edge weight loss**: The Galerkin product `R·A·R^T` sums fine-grid values, but the
-   absolute-value edge weights used for pass-1 aggregate assignment may not reflect true
-   coupling strength in the coarse graph
-3. **SA smoothing on composed aggregates**: The SA prolongator `P = (I - ω D⁻¹A) P_tent`
-   is built from the composed aggregates, but the smoothing stencil (distance-1 in A) may
-   not reach across the larger MIS-2 aggregates, leaving P_tent essentially unsmoothed
-   for nodes far from aggregate boundaries
+Aggregate size histograms:
+```
+[SA-AGG] L0: 160000 → 16143: min=1 avg=9.9 max=26 | 1:114 2:225 3:142 4:933 5-8:4823 9-16:8929 17-32:977
+[SA-AGG] L1: 16143 → 2736:  min=1 avg=5.9 max=13 | 1:13 2:72 3:167 4:332 5-8:1924 9-16:228
+[SA-AGG] L2: 2736 → 217:    min=2 avg=12.6 max=20
+[SA-AGG] L3: 217 → 17:      min=2 avg=12.8 max=19
+```
 
-**Key insight**: SIZE_4 (26 iters, rate 0.626) and SIZE_8 (62 iters, rate 0.827) both
-converge with similar coarsening ratios. The difference is aggregate shape quality — SIZE_4
-produces compact 2×2 blocks, while MIS-2 via Galerkin composition produces irregular shapes.
+PETSc GAMG comparison (same problem, `-pc_gamg_aggressive_coarsening 1`):
+```
+[GAMG-AGG] L0: 160000 → 22463: min=1 avg=7.1 max=13 | 1:2219 2:1863 3:1759 4:1612 5-8:5714 9-16:9296
+[GAMG-AGG] L1: 22463 → 3836:  min=1 avg=5.9 max=15
+[GAMG-AGG] L2: 3836 → 340:    min=1 avg=11.3 max=31
+[GAMG-AGG] L3: 340 → 27:      min=1 avg=12.6 max=36
+16 iterations, rate ~0.49
+```
+
+**Key difference**: AMGX MIS-2 L0 max aggregate size = **26** (977 aggs of size 17-32),
+PETSc GAMG L0 max = **13** (zero aggs >16). AMGX's parallel MIS with random hash weights
+produces more variable aggregate sizes than PETSc's greedy sequential MIS.
 
 #### Comparison (400×400)
 
-| | PETSc GAMG | SIZE_4 | SIZE_8 | MULTI_PAIRWISE | MIS-1 | **MIS-2** |
-|---|-----------|--------|--------|----------------|-------|-----------|
-| Levels | 5 | 7 | 5 | 5 | 5 | **4** |
-| Iterations | 16 | 26 | 62 | 57 | >100 | **>100** |
-| Conv. rate | ~0.49 | 0.626 | 0.827 | 0.809 | 0.960 | **1.021** |
-| Grid cx | 1.167 | 1.314 | 1.166 | 1.146 | 1.406 | **1.105** |
-| Op cx | 1.428 | 2.702 | 1.481 | 1.380 | 2.496 | **1.232** |
-| L0→L1 ratio | ~7× | 4.20× | 6.88× | 7.83× | 2.76× | **9.91×** |
-| Coarsest | 27 | 31 | 49 | 39 | 28 | **24** |
-| Status | ✓ | ✓ | ✓ | ✓ | DNF | **DIVERGE** |
-
-Gap (57 vs 16 iters) is larger than at 200×200 (23 vs 14). Likely causes:
-1. GAMG uses MIS-k aggregation (better aggregate shapes) vs MULTI_PAIRWISE
-2. GAMG eigenvalue estimate via CG vs AMGX power iteration
-3. AMGX convergence rate degrades with problem size (0.59→0.81) while GAMG stays flat (~0.49)
-
-Note: AMGX SIZE_4 selector gives **26 iters** at 400×400 (rate 0.626, op cx 2.70) — closest
-to GAMG's 16 iters but at much higher operator cost.
+| | PETSc GAMG | SIZE_4 | MULTI_PW | **MIS-2 (agg=1)** | MIS-2 (all) | MIS-1 |
+|---|-----------|--------|----------|-------------------|-------------|-------|
+| Levels | 5 | 7 | 5 | **5** | 4 | 5 |
+| Iterations | **16** | 35 | 57 | **82** | >100 (DIV) | >100 |
+| Conv. rate | 0.49 | 0.70 | 0.81 | **0.86** | 1.02 | 0.96 |
+| L0→L1 ratio | 7.1× | 4.2× | 7.8× | **9.9×** | 9.9× | 2.8× |
+| L0 max agg | 13 | 10 | 10 | **26** | 26 | 5 |
+| Op cx | 1.43 | 2.70 | 1.38 | **1.24** | 1.23 | 2.50 |
+| Status | ✓ | ✓ | ✓ | **✓** | DIVERGE | DNF |
 
 ---
 
@@ -410,10 +393,13 @@ to GAMG's 16 iters but at much higher operator cost.
 - [x] Fix coarse solver: DENSE_LU_SOLVER instead of JACOBI_L1
 - [x] Fix min_coarse_rows stopping logic: keep grid that falls below target
 - [x] Implement MIS-1 selector (Steps 1+2 of mis_k_mpi_parallel_plan.md)
-- [x] Verify MIS-1 on 400×400: DNF (rate 0.960) — coarsening too fine (2.76×), need MIS-2+
+- [x] Verify MIS-1 on 400×400: DNF (rate 0.960) — coarsening too fine (2.76×)
 - [x] Implement MIS-2 (mis_k=2) via Galerkin coarsening loop
-- [x] Test MIS-2 on 400×400: **DIVERGES** (rate 1.021) — coarsening ratio good (9.91×) but aggregate quality poor
-- [ ] Diagnose MIS-2 divergence: compare aggregate shapes, try direct MIS-2 kernel, check SA smoothing reach
+- [x] Test MIS-2 on 400×400: diverges without aggressive_levels
+- [x] Add aggressive_levels config: MIS-2 on level 0, MIS-1 on rest → **82 iters, rate 0.864**
+- [x] Add aggregate size histogram diagnostic [SA-AGG]
+- [x] Compare with PETSc GAMG aggregate histograms [GAMG-AGG]
+- [ ] Improve MIS aggregate uniformity: cap max aggregate size or use greedy ordering (target: max≤13, match PETSc)
 - [ ] Step 3: MPI-parallel MIS-k (exchange_halo between passes)
 - [ ] Test block_size > 1 (elasticity problem)
 - [ ] Adaptive SA (multiple near-null vectors via randomized eigenvectors)

@@ -468,7 +468,25 @@ flowchart TD
 
 | Step | Scope | Key Change | Verification | Mode | Status |
 |------|-------|------------|--------------|------|--------|
-| 1 | MIS-1 MPI fix | Add `exchange_halo(status_vec)` after each MIS iteration | Single GPU: identical behavior | code | Not started |
-| 2 | Single-GPU MIS-2 | Galerkin loop with `csr_galerkin_product` | Single GPU: ~4x fewer aggregates | code | Not started |
+| 1 | MIS-1 MPI fix | Add `exchange_halo(status_vec)` after each MIS iteration | Single GPU: identical behavior | code | **Done** |
+| 2 | Single-GPU MIS-2 | Galerkin loop with `csr_galerkin_product` | Single GPU: 9.91× coarsening | code | **Done** |
+| 2b | aggressive_levels | MIS-2 on level 0, MIS-1 on rest (like PETSc GAMG) | 82 iters, rate 0.864 | code | **Done** |
 | 3 | Verify Step 1 multi-GPU | No code changes | Multi-GPU: consistent aggregates at boundaries | debug | Not started |
 | 4 | Multi-GPU MIS-2 | Use `setNeighborAggregates` + `computeAOperator` + `prepareNextLevelMatrix` | Multi-GPU: same quality as single-GPU | code | Not started |
+| 5 | Improve aggregate quality | Cap max aggregate size or use greedy ordering | Target: <60 iters, match PETSc max=13 | code | Not started |
+
+## Results (400×400 Poisson, 160,000 DOFs, May 10 2026)
+
+| Config | Iters | Rate | L0→L1 | L0 max agg | Op cx |
+|--------|-------|------|-------|-----------|-------|
+| PETSc GAMG (MIS-2 L0, MIS-1 rest) | **16** | 0.49 | 7.1× | 13 | 1.43 |
+| AMGX SIZE_4 | 35 | 0.70 | 4.2× | 10 | 2.70 |
+| AMGX MULTI_PAIRWISE | 57 | 0.81 | 7.8× | 10 | 1.38 |
+| **AMGX MIS-2 (aggressive_levels=1)** | **82** | **0.86** | **9.9×** | **26** | **1.23** |
+| AMGX MIS-2 (all levels) | >100 | 1.02 | 9.9× | 26 | 1.23 |
+| AMGX MIS-1 | >100 | 0.96 | 2.8× | 5 | 2.50 |
+
+**Key finding**: AMGX MIS-2 produces aggregates up to size 26 (vs PETSc max=13).
+The parallel MIS algorithm with random hash weights creates more variable aggregate
+sizes than PETSc's greedy sequential MIS. Capping max aggregate size or using a
+greedy-like ordering should close the remaining gap.
