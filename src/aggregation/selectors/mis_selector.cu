@@ -535,10 +535,12 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
     int effective_k = this->m_mis_k;
 
     // Per-level aggressive coarsening control:
-    // aggressive_levels=0 means use mis_k on ALL levels (old behavior)
+    // aggressive_levels=0 means use mis_k on ALL levels
     // aggressive_levels=N means use mis_k on first N levels, mis_k=1 on rest
-    int current_level = this->m_call_count;
-    this->m_call_count++;
+    // Read level index from matrix parameter (set by aggregation_amg_level.cu)
+    int current_level = 0;
+    try { current_level = A.template getParameter<int>("amg_level_index"); }
+    catch (...) { current_level = 0; }
     if (this->m_aggressive_levels > 0 && current_level >= this->m_aggressive_levels)
     {
         effective_k = 1;  // fall back to MIS-1 on non-aggressive levels

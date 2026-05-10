@@ -1990,6 +1990,8 @@ template <class T_Config>
 void Aggregation_AMG_Level_Base<T_Config>::createCoarseVertices()
 {
     //Set the aggregates
+    // Pass level index to selector via matrix parameter (used by MIS selector for aggressive_levels)
+    this->getA().template setParameter<int>("amg_level_index", this->getLevelIndex());
     this->m_selector->setAggregates(this->getA(), this->m_aggregates, this->m_aggregates_fine_idx, this->m_num_aggregates);
 
     // ----------------------------------------------------------
