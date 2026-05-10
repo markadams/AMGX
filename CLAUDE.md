@@ -269,13 +269,13 @@ Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solve
 
 #### PETSc GAMG reference (aggressive_coarsening=1, rtol=1e-5)
 
-| Level | #equations | nnz/row | λ_max |
-|-------|-----------|---------|-------|
-| 4 (finest) | 40000 | 5 | 2.172 |
-| 3 | 5602 | 11 | 1.580 |
-| 2 | 976 | 23 | 1.797 |
-| 1 | 98 | 26 | 1.814 |
-| 0 (coarsest) | 9 | 9 | — (LU) |
+| Level | #equations | nnz/row | rho(D⁻¹A) | λ_max (target) | λ_min (target) |
+|-------|-----------|---------|------------|----------------|----------------|
+| 4 (finest) | 40000 | 5 | 1.974 | 2.172 | 0.197 |
+| 3 | 5602 | 11 | 1.436 | 1.580 | 0.144 |
+| 2 | 976 | 23 | 1.634 | 1.797 | 0.163 |
+| 1 | 98 | 26 | 1.649 | 1.814 | 0.165 |
+| 0 (coarsest) | 9 | 9 | — | — (LU) | — |
 
 - **14 iterations**, rate 0.47, grid cx 1.17, op cx 1.42
 
@@ -292,12 +292,12 @@ Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solve
 
 #### AMGX SA LM4, MULTI_PAIRWISE (3 passes), DENSE_LU (rtol=1e-5)
 
-| Level | #equations | nnz/row | λ_max |
-|-------|-----------|---------|-------|
-| 0 (finest) | 40000 | 5.0 | 2.030 |
-| 1 | 5213 | 11.6 | 1.627 |
-| 2 | 650 | 20.6 | 1.654 |
-| 3 (coarsest) | 79 | 28.5 | — (LU) |
+| Level | #equations | nnz/row | rho(D⁻¹A) | λ_max (rho×1.1) | λ_min (λ_max/10) |
+|-------|-----------|---------|------------|-----------------|-------------------|
+| 0 (finest) | 40000 | 5.0 | 1.846 | 2.030 | 0.203 |
+| 1 | 5213 | 11.6 | 1.480 | 1.627 | 0.163 |
+| 2 | 650 | 20.6 | 1.504 | 1.654 | 0.165 |
+| 3 (coarsest) | 79 | 28.5 | — | — (LU) | — |
 
 - **23 iterations**, rate 0.59, grid cx 1.15, op cx 1.38
 
