@@ -315,17 +315,38 @@ cd ~/Codes/petsc/src/ksp/ksp/tutorials
 
 - **57 iterations**, rate 0.809, grid cx 1.146, op cx 1.380
 
+#### AMGX SA, MIS-1 selector, DENSE_LU (rtol=1e-5) — Perlmutter, May 10 2026
+
+| Level | #equations | nnz/row | ρ(D⁻¹A) | λ_max | λ_min |
+|-------|-----------|---------|----------|-------|-------|
+| 0 (finest) | 160,000 | 5.0 | 1.846 | 2.030 | 0.203 |
+| 1 | 57,872 | 16.9 | 1.674 | 1.841 | 0.184 |
+| 2 | 6,596 | 31.2 | 1.654 | 1.819 | 0.182 |
+| 3 | 413 | 29.0 | 1.441 | 1.585 | 0.159 |
+| 4 (coarsest) | 28 | — | — | — (LU) | — |
+
+- **DID NOT CONVERGE** — hit 100-iteration limit, final residual 6.93 (tolerance ~4e-3)
+- Avg convergence rate: **0.9603** (vs 0.809 for MULTI_PAIRWISE)
+- Grid complexity: 1.406, Operator complexity: 2.496
+- Coarsening ratio L0→L1: only **2.76×** (57,872/160,000) — far too fine
+- Residual oscillates wildly (rates 0.30–3.16) — coarse-grid correction is destabilizing
+
+**Root cause**: MIS-1 (distance-1 neighborhoods) on a 5-point stencil gives ~1/3 coarsening
+ratio per level. Level 1 has 57,872 rows (36% of fine grid) vs MULTI_PAIRWISE's 20,433 (13%).
+The prolongation/restriction operators from distance-1 aggregates are not smooth enough for
+effective SA coarse-grid correction. Need MIS-2 or MIS-3 for adequate coarsening.
+
 #### Comparison (400×400)
 
-| | PETSc GAMG | AMGX SA (MULTI_PAIRWISE) |
-|---|-----------|--------------------------|
-| Levels | 5 | 5 |
-| Iterations | 16 | 57 |
-| Conv. rate | ~0.49 | 0.809 |
-| Grid complexity | 1.167 | 1.146 |
-| Operator complexity | 1.428 | 1.380 |
-| Coarsest grid | 27 (LU) | 39 (LU) |
-| All ρ < 2 | ✓ | ✓ |
+| | PETSc GAMG | AMGX SA (MULTI_PAIRWISE) | AMGX SA (MIS-1) |
+|---|-----------|--------------------------|-----------------|
+| Levels | 5 | 5 | 5 |
+| Iterations | 16 | 57 | >100 (DNF) |
+| Conv. rate | ~0.49 | 0.809 | 0.960 |
+| Grid complexity | 1.167 | 1.146 | 1.406 |
+| Operator complexity | 1.428 | 1.380 | 2.496 |
+| L0→L1 coarsening | ~7× | 7.83× | 2.76× |
+| Coarsest grid | 27 (LU) | 39 (LU) | 28 (LU) |
 
 Gap (57 vs 16 iters) is larger than at 200×200 (23 vs 14). Likely causes:
 1. GAMG uses MIS-k aggregation (better aggregate shapes) vs MULTI_PAIRWISE
@@ -343,7 +364,10 @@ GAMG iteration count but at much higher operator cost.
 - [x] Test with MULTI_PAIRWISE selector — best match to PETSc GAMG
 - [x] Fix coarse solver: DENSE_LU_SOLVER instead of JACOBI_L1
 - [x] Fix min_coarse_rows stopping logic: keep grid that falls below target
-- [ ] Investigate convergence gap (23 vs 14 iters) — try more aggregation_passes
+- [x] Implement MIS-1 selector (Steps 1+2 of mis_k_mpi_parallel_plan.md)
+- [x] Verify MIS-1 on 400×400: DNF (rate 0.960) — coarsening too fine (2.76×), need MIS-2+
+- [ ] Implement MIS-2 (mis_k=2): expect ~8× coarsening ratio, matching GAMG/MULTI_PAIRWISE
+- [ ] Test MIS-2 on 400×400: target <60 iters, rate <0.85
+- [ ] Step 3: MPI-parallel MIS-k (exchange_halo between passes)
 - [ ] Test block_size > 1 (elasticity problem)
 - [ ] Adaptive SA (multiple near-null vectors via randomized eigenvectors)
-- [ ] Implement MIS-based aggregation for better coarse grid quality
