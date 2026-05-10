@@ -3041,10 +3041,11 @@ void Aggregation_AMG_Level_Base<T_Config>::buildTentativeProlongator()
     // P_tent^T * ones should equal ones (each coarse DOF sums to 1).
     // If this fails, the aggregates or QR are broken.
     // ----------------------------------------------------------
-    if (m_null_dim == 1)
+    // Only check for real-valued types (not complex)
+    typedef typename types::PODTypes<ValueTypeB>::type PODType;
+    if (m_null_dim == 1 && sizeof(ValueTypeB) == sizeof(PODType))
     {
-        VVector y_coarse(num_coarse_cols, types::util<ValueTypeB>::get_zero());
-        // Manual P_tent^T * 1: for each row i, add P_tent(i,j) to y_coarse[j]
+        // Manual P_tent^T * 1: for each row i, add P_tent(i,j) to y[j]
         // P_tent has exactly null_dim=1 nonzero per row
         {
             std::vector<IndexType> h_col(nnz);
@@ -3058,7 +3059,10 @@ void Aggregation_AMG_Level_Base<T_Config>::buildTentativeProlongator()
             {
                 int col = h_col[i];
                 if (col >= 0 && col < num_coarse_cols)
-                    y_h[col] += (double)h_val[i];
+                {
+                    PODType pod_val = *reinterpret_cast<PODType*>(&h_val[i]);
+                    y_h[col] += static_cast<double>(pod_val);
+                }
             }
             // Check: all entries should be ~1.0
             double max_err = 0.0;
