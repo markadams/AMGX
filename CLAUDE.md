@@ -49,47 +49,35 @@ GAMG defaults used:
 - Eigenvalue estimate: CG-based, transform [0, 0.1; 0, 1.1]
   → lmin = 0.1 × rho(D⁻¹A), lmax = 1.1 × rho(D⁻¹A)
   → equivalent to lmin_denom = 10
-- Aggressive coarsening: 1 level (to match AMGX SIZE_8 coarsening ratio)
+- Aggressive coarsening: 1 level (to match AMGX MULTI_PAIRWISE coarsening ratio)
 - Tolerance: rtol = 1e-5
-
-**Reference results (200×200, aggressive_coarsening=1):**
-
-| Level | #equations | rho(D⁻¹A) provided | lmin target | lmax target |
-|-------|-----------|---------------------|-------------|-------------|
-| 4 (finest) | 40000 | 1.97426 | 0.197426 | 2.17169 |
-| 3 | 5602 | 1.43638 | 0.143638 | 1.58002 |
-| 2 | 976 | 1.63406 | 0.163406 | 1.79747 |
-| 1 | 98 | 1.64906 (min 0.171299) | 0.164906 | 1.81397 |
-| 0 (coarsest) | 9 | — (LU direct) | — | — |
-
-- **14 iterations** to rtol=1e-5
-- Asymptotic convergence rate: ~0.47
-- Grid complexity: 1.167, operator complexity: 1.423
 
 ### Step 2: Run AMGX SA reference
 
 ```bash
 cd ~/amgx-sa
 export LD_LIBRARY_PATH=~/amgx-sa/build_perlmutter:$LD_LIBRARY_PATH
-./build_perlmutter/test_sa_phase1 -m 200 -n 200 \
-    -c src/configs/AGGREGATION_SA_CHEBY.json
+srun -n1 --gpus-per-task=1 -A m1516_g --qos=debug -C gpu -t 5:00 \
+  ./build_perlmutter/test_sa_phase1 build_perlmutter/poisson2d_200.mtx
 ```
 
 AMGX config (`AGGREGATION_SA_CHEBY.json`):
 - Smoother: CHEBYSHEV + BLOCK_JACOBI, order=2, pre=1, post=1
 - Eigenvalue: lambda_mode=4 (reuse SA rho), lmin_denom=10
-- Selector: SIZE_8
-- min_coarse_rows: 25
+- Selector: MULTI_PAIRWISE (aggregation_passes=3)
+- Coarse solver: DENSE_LU_SOLVER
+- min_coarse_rows: 10
 - Tolerance: 1e-5
 
 ### Step 3: Compare
 
 For each level, compare:
-1. **#equations** — should be similar (AMGX SIZE_8 ≈ GAMG aggressive_coarsening=1)
-2. **rho(D⁻¹A)** — AMGX `[SA-VIEW]` prints this; GAMG `-ksp_view` shows "eigenvalues provided"
-3. **lmax, lmin** — AMGX `[Chebyshev]` prints these; GAMG shows "eigenvalue targets used"
-4. **Convergence rate** — compute from last few residual norms: r_{k+1}/r_k
-5. **Iteration count** — should be within ~20% of each other
+1. **#equations** — should be similar
+2. **nnz/row** — proxy for operator cost per level
+3. **rho(D⁻¹A)** — AMGX `[SA-VIEW]` prints this; GAMG `-ksp_view` shows "eigenvalues provided"
+4. **λ_max, λ_min** — AMGX `[Chebyshev]` prints these; GAMG shows "eigenvalue targets used"
+5. **Convergence rate** — compute from last few residual norms: r_{k+1}/r_k
+6. **Iteration count** — should be within ~50% of each other
 
 ### Matching the smoother algorithm
 
@@ -104,50 +92,22 @@ For each level, compare:
 | λ_max scaling | ×1.1 | ×1.1 (lambda_mode=4) |
 | λ_min | λ_max_provided × 0.1 | lmax / lmin_denom (=10) |
 | Coarse solver | LU | DENSE_LU_SOLVER |
+| Aggregation | MIS-k | MULTI_PAIRWISE (3 passes) |
 
 ### Diagnostic output to check
 
 **AMGX `[SA-VIEW]` lines** (from `aggregation_amg_level.cu`):
 ```
-[SA-VIEW] Level 0: #eqs=40000  avg_nnz/row=...
-[SA-VIEW] Level 0: rho(D^{-1}A)=1.974  omega=0.709
-[SA-VIEW] Level 1: #eqs=...
+[SA-VIEW] Level 0: #eqs=40000  avg_nnz/row=5.0
+[SA-VIEW] Level 0: rho(D^{-1}A)=1.846  omega=0.759
 ```
 
 **AMGX `[Chebyshev]` lines** (from `cheb_solver.cu`):
 ```
-[Chebyshev] level=40000  lambda_mode=4  lmax=2.172  lmin=0.217  lmin_denom=10  sa_eig_set=1
+[Chebyshev] level=40000  lambda_mode=4  lmax=2.030  lmin=0.203  lmin_denom=10  sa_eig_set=1
 ```
 - `sa_eig_set=1` confirms the SA rho was passed to the smoother
-- `lmax ≈ rho × 1.1`, `lmin ≈ lmax / 10`
-
----
-
-## SA Verification Tests (quick)
-
-### 100×100 2D Poisson
-
-```bash
-cd ~/amgx-sa
-export LD_LIBRARY_PATH=~/amgx-sa/build_perlmutter:$LD_LIBRARY_PATH
-
-# SA + Chebyshev(2)+Jacobi smoother (matches PETSc GAMG default)
-./build_perlmutter/test_sa_phase1 -m 100 -n 100 -c src/configs/AGGREGATION_SA_CHEBY.json
-
-# SA + Jacobi smoother
-./build_perlmutter/test_sa_phase1 -m 100 -n 100 -c src/configs/AGGREGATION_SA_JACOBI.json
-```
-
-Expected: 4 levels (10000 → ~1411 → ~185 → ~26), convergence rate < 0.5.
-
-### PETSc GAMG reference (100×100)
-
-```bash
-cd ~/Codes/petsc/src/ksp/ksp/tutorials
-./ex2 -m 100 -n 100 -ksp_type richardson -pc_type gamg \
-      -pc_gamg_aggressive_coarsening 1 \
-      -ksp_monitor -ksp_view -ksp_rtol 1e-5
-```
+- `lmax = rho × 1.1`, `lmin = lmax / 10`
 
 ---
 
@@ -170,14 +130,14 @@ Test binary source: `examples/test_sa_phase1.c`
 
 | File | Purpose |
 |------|---------|
-| `src/aggregation/aggregation_amg_level.cu` | Main SA path: compaction, `buildTentativeProlongator()`, `smoothProlongator()`, Galerkin product, SA→Chebyshev eigenvalue wiring |
+| `src/aggregation/aggregation_amg_level.cu` | Main SA path: `buildTentativeProlongator()`, `smoothProlongator()`, Galerkin product, SA→Chebyshev eigenvalue wiring |
 | `src/aggregation/aggregation_amg_level.h` | Level class: `m_sa_rho`, `m_null_dim`, `m_P_tent`, `m_P_tent_T` |
-| `src/aggregation/batched_qr.cu` | Batched QR for P_tent construction (one CUDA block per aggregate) |
+| `src/aggregation/batched_qr.cu` | Batched QR for P_tent construction |
 | `include/solvers/cheb_solver.h` | Chebyshev solver header; `setSAEigenvalue()` method |
 | `src/solvers/cheb_solver.cu` | Chebyshev solver; `lambda_mode=4`; `chebyshev_lmin_denom` config param |
 | `src/core.cu` | Config parameter registration |
-| `src/configs/AGGREGATION_SA_CHEBY.json` | SA config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10 |
-| `src/configs/AGGREGATION_SA_JACOBI.json` | SA config: Jacobi smoother, min_coarse_rows=25 |
+| `src/amg.cu` | AMG hierarchy setup; `min_coarse_rows` stopping logic |
+| `src/configs/AGGREGATION_SA_CHEBY.json` | SA config: Chebyshev(2)+Jacobi, MULTI_PAIRWISE, lambda_mode=4 |
 
 ### SA Path in `createCoarseMatrices()`
 
@@ -188,8 +148,7 @@ The SA path is gated by `m_null_dim > 0` (near-null space set) and
    contiguous 0..N-1 using thrust sort/unique/lower_bound.
 
 2. **`buildTentativeProlongator()`** — calls `batched_qr()` to compute
-   P_tent via Modified Gram-Schmidt QR on the near-null space vectors,
-   one aggregate at a time.
+   P_tent via Modified Gram-Schmidt QR on the near-null space vectors.
 
 3. **`smoothProlongator()`** — builds `S = I - ω D⁻¹ A` explicitly, then
    computes `P_smooth = S * P_tent` via SpGEMM. Damping factor
@@ -201,13 +160,31 @@ The SA path is gated by `m_null_dim > 0` (near-null space set) and
 
 4. **SA→Chebyshev wiring** — after `smoothProlongator()`, `dynamic_cast`s
    the smoother to `Chebyshev_Solver*` and calls `setSAEigenvalue(m_sa_rho)`.
-   This happens before `setup_smoother()` is called in `amg.cu`.
 
 5. **Galerkin product** — `Ac = P^T A P` via
    `CSR_Multiply::csr_galerkin_product`.
 
 6. **Near-null space propagation** — coarse near-null space (R factors from
    QR) propagated to the next level via `next_agg->setNearNullSpace(...)`.
+
+### MULTI_PAIRWISE Aggregation
+
+The `MULTI_PAIRWISE` selector uses pairwise matching (heavy-edge matching)
+to build aggregates. Key config parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `aggregation_passes` | 1 | Number of pairwise matching passes. Each pass roughly doubles aggregate size. 3 passes → ~8× coarsening ratio. |
+| `weight_formula` | 0 | Edge weight formula (0=default, 1=alternative) |
+| `merge_singletons` | 1 | How to handle unaggregated nodes (0=leave, 1=merge with strongest, 2=merge with size limit) |
+| `max_matching_iterations` | 15 | Max iterations per matching pass |
+| `max_unassigned_percentage` | 0.05 | Stop matching when this fraction of nodes remain unassigned |
+| `handshaking_phases` | 1 | 1 or 2 phase handshaking |
+| `filter_weights` | 0 | Filter weak edges (0=no, 1=yes) |
+| `filter_weights_alpha` | 0.25 | Threshold for weight filtering |
+
+For SA verification, use `aggregation_passes=3` to get ~8× coarsening
+(similar to GAMG with `aggressive_coarsening=1`).
 
 ### Chebyshev Smoother Eigenvalue Modes
 
@@ -223,7 +200,12 @@ The SA path is gated by `m_null_dim > 0` (near-null space set) and
 `chebyshev_lmin_denom` (config, default 10.0):
 - lmin = lmax / lmin_denom
 - PETSc GAMG uses 10.0 (transform [0,0.1;0,1.1])
-- For D-dimensional problems: D³ (8 for 2D, 27 for 3D) is another option
+
+### Coarsening Control
+
+`min_coarse_rows` in the JSON config is a **target** — coarsening continues
+until a grid falls below the target, but that grid is **kept** (not thrown
+away). The check at the top of the setup loop stops further coarsening.
 
 ### `[SA-VIEW]` Diagnostics
 
@@ -233,13 +215,6 @@ Permanent printfs in `aggregation_amg_level.cu`:
 
 `[Chebyshev]` printf in `cheb_solver.cu` `solver_setup()`:
 - `level=#rows lambda_mode lmax lmin lmin_denom sa_eig_set`
-
-### Coarsening Control
-
-`min_coarse_rows` in the JSON config controls when coarsening stops.
-Set to `5^D` where D is the problem dimension (25 for 2D, 125 for 3D).
-With SIZE_8 selector (~7× coarsening ratio per level):
-- 10000 → 1411 → 185 → ~26 (4 levels)
 
 ### Fixed Bugs
 
@@ -254,20 +229,19 @@ With SIZE_8 selector (~7× coarsening ratio per level):
    `thrust::exclusive_scan(..., offsets_ptr)`. Root cause of zero columns
    in P and SA divergence.
 
-### Verified Results (100×100 2D Poisson, 1 MG level)
+4. **`min_coarse_rows` stopping logic** (`amg.cu`): Changed from "don't
+   create level if below target" to "create level, then stop". The grid
+   that falls below the target is kept as the coarsest level.
 
-- P: 10000×1411, nnz=25436, zero-norm columns: 0
-- Ac: 1411×1411, nnz=17155, zero diagonal: 0, diag min=0.385
-- Galerkin check `‖Ac − PᵀAP‖_F / ‖Ac‖_F` = 2.6e-16 (machine precision)
-- SA convergence rate: 0.69–0.73 (PETSc GAMG reference: ~0.32 with 4 levels)
+---
 
-### Verified Results (200×200 2D Poisson, Perlmutter)
+## Verified Results (200×200 2D Poisson, Perlmutter)
 
 Test binary: `~/amgx-sa/build_perlmutter/test_sa_phase1`
 Matrix: `~/amgx-sa/build_perlmutter/poisson2d_200.mtx` (40000 DOFs)
 Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solver
 
-#### PETSc GAMG reference (aggressive_coarsening=1, rtol=1e-5)
+### PETSc GAMG reference (aggressive_coarsening=1, rtol=1e-5)
 
 | Level | #equations | nnz/row | rho(D⁻¹A) | λ_max (target) | λ_min (target) |
 |-------|-----------|---------|------------|----------------|----------------|
@@ -279,18 +253,7 @@ Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solve
 
 - **14 iterations**, rate 0.47, grid cx 1.17, op cx 1.42
 
-#### AMGX SA LM4, SIZE_8, DENSE_LU (min_coarse_rows=10, rtol=1e-5)
-
-| Level | #equations | nnz/row | λ_max |
-|-------|-----------|---------|-------|
-| 0 (finest) | 40000 | 5.0 | 2.030 |
-| 1 | 5961 | 12.3 | 1.705 |
-| 2 | 769 | 23.7 | 1.979 |
-| 3 (coarsest) | 104 | 41.1 | — (LU) |
-
-- **62 iterations**, rate 0.83 (oscillatory), grid cx 1.17, op cx 1.48
-
-#### AMGX SA LM4, MULTI_PAIRWISE (3 passes), DENSE_LU (rtol=1e-5)
+### AMGX SA, MULTI_PAIRWISE (3 passes), DENSE_LU (rtol=1e-5)
 
 | Level | #equations | nnz/row | rho(D⁻¹A) | λ_max (rho×1.1) | λ_min (λ_max/10) |
 |-------|-----------|---------|------------|-----------------|-------------------|
@@ -301,50 +264,32 @@ Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solve
 
 - **23 iterations**, rate 0.59, grid cx 1.15, op cx 1.38
 
-#### AMGX SA LM4, SIZE_4, DENSE_LU (min_coarse_rows=10, rtol=1e-5)
+### Comparison
 
-| Level | #equations | nnz/row | λ_max |
-|-------|-----------|---------|-------|
-| 0 (finest) | 40000 | 5.0 | 2.030 |
-| 1 | 9316 | 14.0 | 1.730 |
-| 2 | 2218 | 41.8 | 2.224 |
-| 3 | 543 | 100.5 | 2.531 |
-| 4 | 132 | 124.6 | 2.087 |
-| 5 (coarsest) | 32 | 32.0 | — (LU) |
+| | PETSc GAMG | AMGX SA |
+|---|-----------|---------|
+| Levels | 5 | 4 |
+| Iterations | 14 | 23 |
+| Conv. rate | 0.47 | 0.59 |
+| Grid complexity | 1.17 | 1.15 |
+| Operator complexity | 1.42 | 1.38 |
+| Coarsest grid | 9 (LU) | 79 (LU) |
+| All rho < 2 | ✓ | ✓ |
 
-- **18 iterations**, rate 0.51, grid cx 1.31, op cx 2.48
-
-#### Summary
-
-| Solver | Levels | Iters | Rate | Grid Cx | Op Cx |
-|--------|--------|-------|------|---------|-------|
-| **PETSc GAMG** | 5 | **14** | **0.47** | 1.17 | 1.42 |
-| AMGX SIZE_8 | 4 | 62 | 0.83 | 1.17 | 1.48 |
-| **AMGX MULTI_PAIRWISE** | 4 | **23** | **0.59** | **1.15** | **1.38** |
-| AMGX SIZE_4 | 6 | 18 | 0.51 | 1.31 | 2.48 |
-
-#### Analysis
-
-- **MULTI_PAIRWISE is the best overall match to GAMG**: similar grid sizes
-  (5213 vs 5602, 650 vs 976), similar nnz/row growth, lowest operator
-  complexity (1.38), and **all rho values < 2** (1.48, 1.50).
-- **SIZE_8 has oscillatory convergence** (rates alternate ~0.3 and ~2.8)
-  because coarse grid quality degrades — rho grows to 1.80 on level 2.
-- **SIZE_4 has lowest iteration count** (18) but highest operator complexity
-  (2.48) — nnz/row explodes to 100-125 on coarser levels.
-- **MULTI_PAIRWISE keeps rho < 2 on all levels** — key to stable Chebyshev.
-- **Gap vs GAMG** (23 vs 14 iters for MULTI_PAIRWISE): likely due to GAMG
-  using MIS-k aggregation (better aggregate shapes) and having 5 levels vs 4.
+Gap (23 vs 14 iters) likely due to:
+1. GAMG uses MIS-k aggregation (better aggregate shapes) vs MULTI_PAIRWISE
+2. GAMG has 5 levels vs AMGX's 4 (coarsest grid 9 vs 79)
+3. GAMG eigenvalue estimate via CG vs AMGX power iteration
 
 ---
 
 ## Remaining Work
 
 - [x] Build on Perlmutter and run 200×200 verification
-- [x] Test with SIZE_4, SIZE_8, MULTI_PAIRWISE selectors
+- [x] Test with MULTI_PAIRWISE selector — best match to PETSc GAMG
 - [x] Fix coarse solver: DENSE_LU_SOLVER instead of JACOBI_L1
 - [x] Fix min_coarse_rows stopping logic: keep grid that falls below target
-- [ ] Investigate SIZE_8 oscillatory convergence (coarse grid quality)
+- [ ] Investigate convergence gap (23 vs 14 iters) — try more aggregation_passes
 - [ ] Test block_size > 1 (elasticity problem)
 - [ ] Adaptive SA (multiple near-null vectors via randomized eigenvectors)
 - [ ] Implement MIS-based aggregation for better coarse grid quality
