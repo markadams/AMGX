@@ -156,9 +156,8 @@ cd ~/Codes/petsc/src/ksp/ksp/tutorials
 ```bash
 cd ~/amgx-sa/build_perlmutter
 # Interactive GPU node required:
-salloc -N1 -C gpu --gpus=1 -A m4267_g --qos=debug -t 30:00
-srun -n1 --gpus-per-task=1 ./test_sa_phase1 -m 200 -n 200 \
-     -c ../src/configs/AGGREGATION_SA_CHEBY.json
+salloc -N1 -C gpu --gpus=1 -A m1516_g --qos=debug -t 30:00
+srun -n1 --gpus-per-task=1 ./test_sa_phase1 poisson2d_200.mtx
 ```
 
 Test binary source: `examples/test_sa_phase1.c`
@@ -270,65 +269,82 @@ Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solve
 
 #### PETSc GAMG reference (aggressive_coarsening=1, rtol=1e-5)
 
-| Level | #equations | rho(D⁻¹A) |
-|-------|-----------|-----------|
-| 0 (finest) | 40000 | 1.974 |
-| 1 | 5602 | 1.436 |
-| 2 | 976 | 1.634 |
-| 3 | 98 | 1.649 |
-| 4 (coarsest) | 9 | — (LU) |
+| Level | #equations | nnz/row | λ_max |
+|-------|-----------|---------|-------|
+| 4 (finest) | 40000 | 5 | 2.172 |
+| 3 | 5602 | 11 | 1.580 |
+| 2 | 976 | 23 | 1.797 |
+| 1 | 98 | 26 | 1.814 |
+| 0 (coarsest) | 9 | 9 | — (LU) |
 
-- **14 iterations**, convergence rate ~0.47
-- Grid complexity: 1.167, operator complexity: 1.423
+- **14 iterations**, rate 0.47, grid cx 1.17, op cx 1.42
 
-#### AMGX SA LM4, SIZE_8, DENSE_LU coarse (rtol=1e-5)
+#### AMGX SA LM4, SIZE_8, DENSE_LU (min_coarse_rows=10, rtol=1e-5)
 
-| Level | #equations | rho(D⁻¹A) | lmax | lmin |
-|-------|-----------|-----------|------|------|
-| 0 (finest) | 40000 | 1.846 | 2.030 | 0.203 |
-| 1 | 5979 | 1.547 | 1.702 | 0.170 |
-| 2 (coarsest) | 774 | — (LU) | — | — |
+| Level | #equations | nnz/row | λ_max |
+|-------|-----------|---------|-------|
+| 0 (finest) | 40000 | 5.0 | 2.030 |
+| 1 | 5961 | 12.3 | 1.705 |
+| 2 | 769 | 23.7 | 1.979 |
+| 3 (coarsest) | 104 | 41.1 | — (LU) |
 
-- **29 iterations**, convergence rate 0.67
-- Grid complexity: 1.169, operator complexity: 1.461
-- Only 3 levels — SIZE_8 coarsens too aggressively, coarsest grid (774 DOFs) is too large for effective LU but too small for further coarsening with min_coarse_rows=25
+- **62 iterations**, rate 0.83 (oscillatory), grid cx 1.17, op cx 1.48
 
-#### AMGX SA LM4, SIZE_4, DENSE_LU coarse (rtol=1e-5) ✓ Best match
+#### AMGX SA LM4, MULTI_PAIRWISE (3 passes), DENSE_LU (rtol=1e-5)
 
-| Level | #equations | rho(D⁻¹A) | lmax | lmin |
-|-------|-----------|-----------|------|------|
-| 0 (finest) | 40000 | 1.846 | 2.030 | 0.203 |
-| 1 | 9317 | 1.573 | 1.730 | 0.173 |
-| 2 | 2204 | 2.038 | 2.242 | 0.224 |
-| 3 | 539 | 2.182 | 2.400 | 0.240 |
-| 4 (coarsest) | 132 | — (LU) | — | — |
+| Level | #equations | nnz/row | λ_max |
+|-------|-----------|---------|-------|
+| 0 (finest) | 40000 | 5.0 | 2.030 |
+| 1 | 5213 | 11.6 | 1.627 |
+| 2 | 650 | 20.6 | 1.654 |
+| 3 (coarsest) | 79 | 28.5 | — (LU) |
 
-- **17 iterations**, convergence rate 0.50
-- Grid complexity: 1.305, operator complexity: 2.469
-- 5 levels (matches PETSc's 5 levels)
-- Convergence rate 0.50 vs PETSc's 0.47 — **excellent agreement**
+- **23 iterations**, rate 0.59, grid cx 1.15, op cx 1.38
+
+#### AMGX SA LM4, SIZE_4, DENSE_LU (min_coarse_rows=10, rtol=1e-5)
+
+| Level | #equations | nnz/row | λ_max |
+|-------|-----------|---------|-------|
+| 0 (finest) | 40000 | 5.0 | 2.030 |
+| 1 | 9316 | 14.0 | 1.730 |
+| 2 | 2218 | 41.8 | 2.224 |
+| 3 | 543 | 100.5 | 2.531 |
+| 4 | 132 | 124.6 | 2.087 |
+| 5 (coarsest) | 32 | 32.0 | — (LU) |
+
+- **18 iterations**, rate 0.51, grid cx 1.31, op cx 2.48
+
+#### Summary
+
+| Solver | Levels | Iters | Rate | Grid Cx | Op Cx |
+|--------|--------|-------|------|---------|-------|
+| **PETSc GAMG** | 5 | **14** | **0.47** | 1.17 | 1.42 |
+| AMGX SIZE_8 | 4 | 62 | 0.83 | 1.17 | 1.48 |
+| **AMGX MULTI_PAIRWISE** | 4 | **23** | **0.59** | **1.15** | **1.38** |
+| AMGX SIZE_4 | 6 | 18 | 0.51 | 1.31 | 2.48 |
 
 #### Analysis
 
-SIZE_4 gives the best match to PETSc GAMG:
-- **17 vs 14 iterations** (21% more) — very reasonable given different aggregation algorithms
-- **Rate 0.50 vs 0.47** — close match
-- Remaining differences likely due to:
-  1. Different aggregation patterns (AMGX SIZE_4 vs GAMG MIS-based)
-  2. Higher rho(D⁻¹A) on coarser levels (2.038, 2.182 vs 1.634, 1.649)
-  3. Higher operator complexity (2.47 vs 1.42) — SIZE_4 produces denser coarse operators
-  4. Coarsest grid 132 DOFs vs PETSc's 9 DOFs
-
-The oscillatory convergence with JACOBI_L1 coarse solver (66 iters, rate 0.84) was
-entirely due to inaccurate coarse solve. Switching to DENSE_LU_SOLVER fixed this.
+- **MULTI_PAIRWISE is the best overall match to GAMG**: similar grid sizes
+  (5213 vs 5602, 650 vs 976), similar nnz/row growth, lowest operator
+  complexity (1.38), and **all rho values < 2** (1.48, 1.50).
+- **SIZE_8 has oscillatory convergence** (rates alternate ~0.3 and ~2.8)
+  because coarse grid quality degrades — rho grows to 1.80 on level 2.
+- **SIZE_4 has lowest iteration count** (18) but highest operator complexity
+  (2.48) — nnz/row explodes to 100-125 on coarser levels.
+- **MULTI_PAIRWISE keeps rho < 2 on all levels** — key to stable Chebyshev.
+- **Gap vs GAMG** (23 vs 14 iters for MULTI_PAIRWISE): likely due to GAMG
+  using MIS-k aggregation (better aggregate shapes) and having 5 levels vs 4.
 
 ---
 
 ## Remaining Work
 
-- [x] Build on Perlmutter and run 200×200 verification (compare vs PETSc GAMG reference)
-- [x] Test with SIZE_4 selector — **best match to PETSc GAMG** (17 iters, rate 0.50)
+- [x] Build on Perlmutter and run 200×200 verification
+- [x] Test with SIZE_4, SIZE_8, MULTI_PAIRWISE selectors
 - [x] Fix coarse solver: DENSE_LU_SOLVER instead of JACOBI_L1
+- [x] Fix min_coarse_rows stopping logic: keep grid that falls below target
+- [ ] Investigate SIZE_8 oscillatory convergence (coarse grid quality)
 - [ ] Test block_size > 1 (elasticity problem)
 - [ ] Adaptive SA (multiple near-null vectors via randomized eigenvectors)
-- [ ] Investigate why SIZE_4 coarse-level rho values are higher than PETSc's
+- [ ] Implement MIS-based aggregation for better coarse grid quality
