@@ -3035,6 +3035,65 @@ void Aggregation_AMG_Level_Base<T_Config>::buildTentativeProlongator()
     m_P_tent.set_initialized(1);
 
     // ----------------------------------------------------------
+    // Diagnostic: verify P_tent^T * 1 = 1 (SA fundamental requirement)
+    //
+    // For null_dim=1 (scalar near-null space = constant vector),
+    // P_tent^T * ones should equal ones (each coarse DOF sums to 1).
+    // If this fails, the aggregates or QR are broken.
+    // ----------------------------------------------------------
+    if (m_null_dim == 1)
+    {
+        VVector y_coarse(num_coarse_cols, types::util<ValueTypeB>::get_zero());
+        // Manual P_tent^T * 1: for each row i, add P_tent(i,j) to y_coarse[j]
+        // P_tent has exactly null_dim=1 nonzero per row
+        {
+            std::vector<IndexType> h_col(nnz);
+            std::vector<ValueTypeB> h_val(nnz);
+            cudaMemcpy(h_col.data(), m_P_tent.col_indices.raw(),
+                       nnz * sizeof(IndexType), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_val.data(), m_P_tent.values.raw(),
+                       nnz * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            std::vector<double> y_h(num_coarse_cols, 0.0);
+            for (int i = 0; i < nnz; i++)
+            {
+                int col = h_col[i];
+                if (col >= 0 && col < num_coarse_cols)
+                    y_h[col] += (double)h_val[i];
+            }
+            // Check: all entries should be ~1.0
+            double max_err = 0.0;
+            int worst_col = -1;
+            int num_bad = 0;
+            for (int j = 0; j < num_coarse_cols; j++)
+            {
+                double err = fabs(y_h[j] - 1.0);
+                if (err > max_err) { max_err = err; worst_col = j; }
+                if (err > 1e-6) num_bad++;
+            }
+            amgx_printf("[SA-CHECK] P_tent^T * 1: num_fine=%d, num_coarse=%d, "
+                        "max|P_tent^T*1 - 1| = %.6e at col %d, "
+                        "%d/%d cols with err>1e-6\n",
+                        num_fine_rows, num_coarse_cols,
+                        max_err, worst_col, num_bad, num_coarse_cols);
+            if (num_bad > 0)
+            {
+                // Print first few bad columns
+                int printed = 0;
+                for (int j = 0; j < num_coarse_cols && printed < 10; j++)
+                {
+                    double err = fabs(y_h[j] - 1.0);
+                    if (err > 1e-6)
+                    {
+                        amgx_printf("[SA-CHECK]   col %d: P_tent^T*1 = %.6f (err=%.6e)\n",
+                                    j, y_h[j], err);
+                        printed++;
+                    }
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------
     // 5. Store coarse near-null space (R factors from QR)
     //    Reshape from per-aggregate column-major R to global
     //    column-major B_c layout for the next coarser level.
