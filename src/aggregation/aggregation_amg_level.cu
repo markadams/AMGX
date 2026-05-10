@@ -1992,6 +1992,59 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseVertices()
     //Set the aggregates
     this->m_selector->setAggregates(this->getA(), this->m_aggregates, this->m_aggregates_fine_idx, this->m_num_aggregates);
 
+    // ----------------------------------------------------------
+    // Diagnostic: aggregate size histogram
+    // ----------------------------------------------------------
+    {
+        int num_nodes = this->getA().get_num_rows();
+        int num_aggs  = this->m_num_aggregates;
+        if (num_aggs > 0 && num_nodes > 0)
+        {
+            // Copy aggregates to host
+            std::vector<int> h_agg(num_nodes);
+            cudaMemcpy(h_agg.data(), this->m_aggregates.raw(),
+                       num_nodes * sizeof(int), cudaMemcpyDeviceToHost);
+            // Count aggregate sizes
+            std::vector<int> agg_sizes(num_aggs, 0);
+            for (int i = 0; i < num_nodes; i++)
+            {
+                int a = h_agg[i];
+                if (a >= 0 && a < num_aggs) agg_sizes[a]++;
+            }
+            // Compute stats
+            int min_sz = num_nodes, max_sz = 0;
+            double sum_sz = 0.0;
+            for (int j = 0; j < num_aggs; j++)
+            {
+                if (agg_sizes[j] < min_sz) min_sz = agg_sizes[j];
+                if (agg_sizes[j] > max_sz) max_sz = agg_sizes[j];
+                sum_sz += agg_sizes[j];
+            }
+            double avg_sz = sum_sz / num_aggs;
+            // Build histogram (buckets: 1, 2, 3, 4, 5-8, 9-16, 17-32, 33+)
+            int hist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int j = 0; j < num_aggs; j++)
+            {
+                int s = agg_sizes[j];
+                if      (s <= 1)  hist[0]++;
+                else if (s == 2)  hist[1]++;
+                else if (s == 3)  hist[2]++;
+                else if (s == 4)  hist[3]++;
+                else if (s <= 8)  hist[4]++;
+                else if (s <= 16) hist[5]++;
+                else if (s <= 32) hist[6]++;
+                else              hist[7]++;
+            }
+            amgx_printf("[SA-AGG] %d nodes -> %d aggs: "
+                        "min=%d avg=%.1f max=%d | "
+                        "hist: 1:%d 2:%d 3:%d 4:%d 5-8:%d 9-16:%d 17-32:%d 33+:%d\n",
+                        num_nodes, num_aggs,
+                        min_sz, avg_sz, max_sz,
+                        hist[0], hist[1], hist[2], hist[3],
+                        hist[4], hist[5], hist[6], hist[7]);
+        }
+    }
+
     if ( this->m_print_aggregation_info )
     {
         this->m_selector->printAggregationInfo( this->m_aggregates, this->m_aggregates_fine_idx, this->m_num_aggregates );
