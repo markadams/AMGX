@@ -86,6 +86,7 @@
 #include <aggregation/selectors/multi_pairwise.h>
 #include <aggregation/selectors/geo_selector.h>
 #include <aggregation/selectors/parallel_greedy_selector.h>
+#include <aggregation/selectors/mis_selector.h>
 //#include <aggregation/selectors/serial_greedy.h>
 //#include <aggregation/selectors/adaptive.h>
 
@@ -462,7 +463,7 @@ inline void registerParameters()
     //Register Selector (SIZE_[2|4|8]) Parameters
     std::vector<std::string> classical_selector_values = getClassicalSelectors(), aggregation_selector_values = getAggregationSelectors(), combined_selectors = classical_selector_values;
     combined_selectors.insert(combined_selectors.end(), aggregation_selector_values.begin(), aggregation_selector_values.end());
-    AMG_Config::registerParameter<std::string>("selector", "the coarse grid selection algorithm (Classical: <PMIS|AGGRESSIVE_PMIS|HMIS|AGGRESSIVE_HMIS|DUMMY>, Aggregation: <SIZE_2|SIZE_4|SIZE_8|MULTI_PAIRWISE>)", "PMIS", combined_selectors);
+    AMG_Config::registerParameter<std::string>("selector", "the coarse grid selection algorithm (Classical: <PMIS|AGGRESSIVE_PMIS|HMIS|AGGRESSIVE_HMIS|DUMMY>, Aggregation: <SIZE_2|SIZE_4|SIZE_8|MULTI_PAIRWISE|MIS>)", "PMIS", combined_selectors);
     AMG_Config::registerParameter<int>("aggressive_levels", "the number of levels to use aggressive coarsening for (Classical only)", 0);
     AMG_Config::registerParameter<std::string>("aggressive_selector", "the aggressive coarse grid selection algorithm, DEFAULT is same as \"selector\" (Classical only) <PMIS|HMIS|DEFAULT>", "DEFAULT", classical_selector_values);
     AMG_Config::registerParameter<std::string>("aggressive_interpolator", "the interpolation algorithm for aggressive coarsening (Classical only) <MULTIPASS>", "MULTIPASS", classical_selector_values);
@@ -472,6 +473,7 @@ inline void registerParameters()
     AMG_Config::registerParameter<double>("max_unassigned_percentage", "the maximum percentage of vertices that are left unaggregated in first phase of matching algorithms <0.05>", 0.05);
     //Register Selector (MULTI_PAIRWISE) Parameters
     AMG_Config::registerParameter<int>("weight_formula", "choose the weight formula. 0: wij=0.5*(|a_ij|+|aji|)/max(|a_ii|,|a_jj|). 1: wij=-0.5(a_ij/a_ii + a_ji/a_jj) <0>", 0);
+    AMG_Config::registerParameter<int>("mis_k", "for selector=MIS: distance parameter k (1=standard MIS, 2=aggressive coarsening) <1>", 1);
     AMG_Config::registerParameter<int>("aggregation_passes", "for selector=MULTI_PAIRWISE: each pass about doubles the size of each aggregate", 3);
     AMG_Config::registerParameter<int>("filter_weights", "for selector=MULTI_PAIRWISE: set to 1 to remove weak edges before building aggregates. <0>", 0);
     AMG_Config::registerParameter<double>("filter_weights_alpha", "for selector=MULTI_PAIRWISE: a weight is considered weak iff w_ij<alpha*sqrt(max{w_ik}*max{w_jl}). alpha has to be in range (0,1) <0.5>", 0.5, 0.0, 1.0);
@@ -645,6 +647,7 @@ struct registerClasses<T_Config, false>
         aggregation::SelectorFactory<T_Config>::registerFactory("SIZE_4", new aggregation::size4_selector::Size4SelectorFactory<T_Config>);
         aggregation::SelectorFactory<T_Config>::registerFactory("SIZE_8", new aggregation::size8_selector::Size8SelectorFactory<T_Config>);
         aggregation::SelectorFactory<T_Config>::registerFactory("MULTI_PAIRWISE", new aggregation::multi_pairwise::MultiPairwiseSelectorFactory<T_Config>);
+        aggregation::SelectorFactory<T_Config>::registerFactory("MIS", new aggregation::mis_selector::MISSelectorFactory<T_Config>);
         aggregation::SelectorFactory<T_Config>::registerFactory("DUMMY", new aggregation::DUMMY_SelectorFactory<T_Config>); //not exposed
         aggregation::SelectorFactory<T_Config>::registerFactory("GEO", new aggregation::GEO_SelectorFactory<T_Config>); //not exposed
         aggregation::SelectorFactory<T_Config>::registerFactory("PARALLEL_GREEDY_SELECTOR", new aggregation::ParallelGreedySelectorFactory<T_Config>); //not exposed

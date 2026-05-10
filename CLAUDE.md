@@ -235,16 +235,18 @@ Permanent printfs in `aggregation_amg_level.cu`:
 
 ---
 
-## Verified Results (200×200 2D Poisson, Perlmutter)
+## Verified Results
+
+### 200×200 2D Poisson (40,000 DOFs, Perlmutter)
 
 Test binary: `~/amgx-sa/build_perlmutter/test_sa_phase1`
-Matrix: `~/amgx-sa/build_perlmutter/poisson2d_200.mtx` (40000 DOFs)
+Matrix: `~/amgx-sa/build_perlmutter/poisson2d_200.mtx`
 Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solver
 
-### PETSc GAMG reference (aggressive_coarsening=1, rtol=1e-5)
+#### PETSc GAMG reference (aggressive_coarsening=1, rtol=1e-5) — runs locally
 
-| Level | #equations | nnz/row | rho(D⁻¹A) | λ_max (target) | λ_min (target) |
-|-------|-----------|---------|------------|----------------|----------------|
+| Level | #equations | nnz/row | ρ(D⁻¹A) | λ_max (target) | λ_min (target) |
+|-------|-----------|---------|----------|----------------|----------------|
 | 4 (finest) | 40000 | 5 | 1.974 | 2.172 | 0.197 |
 | 3 | 5602 | 11 | 1.436 | 1.580 | 0.144 |
 | 2 | 976 | 23 | 1.634 | 1.797 | 0.163 |
@@ -253,10 +255,10 @@ Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solve
 
 - **14 iterations**, rate 0.47, grid cx 1.17, op cx 1.42
 
-### AMGX SA, MULTI_PAIRWISE (3 passes), DENSE_LU (rtol=1e-5)
+#### AMGX SA, MULTI_PAIRWISE (3 passes), DENSE_LU (rtol=1e-5)
 
-| Level | #equations | nnz/row | rho(D⁻¹A) | λ_max (rho×1.1) | λ_min (λ_max/10) |
-|-------|-----------|---------|------------|-----------------|-------------------|
+| Level | #equations | nnz/row | ρ(D⁻¹A) | λ_max (ρ×1.1) | λ_min (λ_max/10) |
+|-------|-----------|---------|----------|----------------|-------------------|
 | 0 (finest) | 40000 | 5.0 | 1.846 | 2.030 | 0.203 |
 | 1 | 5213 | 11.6 | 1.480 | 1.627 | 0.163 |
 | 2 | 650 | 20.6 | 1.504 | 1.654 | 0.165 |
@@ -264,7 +266,7 @@ Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solve
 
 - **23 iterations**, rate 0.59, grid cx 1.15, op cx 1.38
 
-### Comparison
+#### Comparison (200×200)
 
 | | PETSc GAMG | AMGX SA |
 |---|-----------|---------|
@@ -274,12 +276,64 @@ Config: Chebyshev(2)+Jacobi, lambda_mode=4, lmin_denom=10, DENSE_LU coarse solve
 | Grid complexity | 1.17 | 1.15 |
 | Operator complexity | 1.42 | 1.38 |
 | Coarsest grid | 9 (LU) | 79 (LU) |
-| All rho < 2 | ✓ | ✓ |
+| All ρ < 2 | ✓ | ✓ |
 
-Gap (23 vs 14 iters) likely due to:
+---
+
+### 400×400 2D Poisson (160,000 DOFs)
+
+Matrix: `~/amgx-sa/build_perlmutter/poisson2d_400.mtx` (generated via `./examples/generate_poisson -p 5 400 400`)
+
+#### PETSc GAMG reference (aggressive_coarsening=1, rtol=1e-5) — runs locally
+
+```bash
+cd ~/Codes/petsc/src/ksp/ksp/tutorials
+./ex2 -m 400 -n 400 -ksp_type richardson -pc_type gamg \
+      -pc_gamg_aggressive_coarsening 1 \
+      -ksp_monitor -ksp_view -ksp_rtol 1e-5
+```
+
+| Level | #equations | nnz/row | ρ(D⁻¹A) | λ_max (target) | λ_min (target) |
+|-------|-----------|---------|----------|----------------|----------------|
+| 4 (finest) | 160,000 | 5 | 1.974 | 2.171 | 0.197 |
+| 3 | 22,463 | 11 | 1.446 | 1.591 | 0.145 |
+| 2 | 3,836 | 23 | 1.642 | 1.806 | 0.164 |
+| 1 | 340 | 28 | 1.552 | 1.707 | 0.155 |
+| 0 (coarsest) | 27 | 17 | — | — (LU) | — |
+
+- **16 iterations**, grid cx 1.167, op cx 1.428
+
+#### AMGX SA, MULTI_PAIRWISE (3 passes), DENSE_LU (rtol=1e-5)
+
+| Level | #equations | nnz/row | ρ(D⁻¹A) | λ_max (ρ×1.1) | λ_min (λ_max/10) |
+|-------|-----------|---------|----------|----------------|-------------------|
+| 0 (finest) | 160,000 | 5.0 | 1.846 | 2.030 | 0.203 |
+| 1 | 20,433 | 11.6 | 1.506 | 1.656 | 0.166 |
+| 2 | 2,569 | 21.0 | 1.486 | 1.634 | 0.163 |
+| 3 | 321 | 34.5 | 1.731 | 1.905 | 0.190 |
+| 4 (coarsest) | 39 | — | — | — (LU) | — |
+
+- **57 iterations**, rate 0.809, grid cx 1.146, op cx 1.380
+
+#### Comparison (400×400)
+
+| | PETSc GAMG | AMGX SA (MULTI_PAIRWISE) |
+|---|-----------|--------------------------|
+| Levels | 5 | 5 |
+| Iterations | 16 | 57 |
+| Conv. rate | ~0.49 | 0.809 |
+| Grid complexity | 1.167 | 1.146 |
+| Operator complexity | 1.428 | 1.380 |
+| Coarsest grid | 27 (LU) | 39 (LU) |
+| All ρ < 2 | ✓ | ✓ |
+
+Gap (57 vs 16 iters) is larger than at 200×200 (23 vs 14). Likely causes:
 1. GAMG uses MIS-k aggregation (better aggregate shapes) vs MULTI_PAIRWISE
-2. GAMG has 5 levels vs AMGX's 4 (coarsest grid 9 vs 79)
-3. GAMG eigenvalue estimate via CG vs AMGX power iteration
+2. GAMG eigenvalue estimate via CG vs AMGX power iteration
+3. AMGX convergence rate degrades with problem size (0.59→0.81) while GAMG stays flat (~0.49)
+
+Note: AMGX SIZE_4 selector gives **23 iters** at 400×400 (rate 0.602, op cx 2.68) — matches
+GAMG iteration count but at much higher operator cost.
 
 ---
 
