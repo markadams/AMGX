@@ -57,6 +57,38 @@ static const int MIS_ROOT       =  1;
 static const int MIS_NOT_ROOT   =  0;
 
 // -----------------------------------------------------------------------
+// Named device functors to replace __device__ lambdas.
+// CUDA does not allow extended __device__ lambdas inside private or
+// protected member functions, so we use named functors at namespace scope.
+// -----------------------------------------------------------------------
+
+// Functor: set any value to MIS_ROOT (used in transform_if)
+struct SetMISRoot
+{
+    __device__ int operator()(int /*s*/) const { return MIS_ROOT; }
+};
+
+// Functor: predicate — true if status is MIS_UNDECIDED
+struct IsUndecided
+{
+    __device__ bool operator()(int s) const { return s == MIS_UNDECIDED; }
+};
+
+// Functor: cast float edge weight to ValueType (template)
+template <typename ValueType>
+struct FloatToValueType
+{
+    __device__ ValueType operator()(float v) const { return (ValueType)v; }
+};
+
+// Functor: absolute value of ValueType cast to float (for coarse edge weights)
+template <typename ValueType>
+struct AbsToFloat
+{
+    __device__ float operator()(ValueType v) const { return fabsf((float)v); }
+};
+
+// -----------------------------------------------------------------------
 // Kernel: assign_node_weights
 //
 // Assigns a deterministic pseudo-random weight in [0,1) to each node
@@ -532,8 +564,9 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
     cudaFuncSetCacheConfig(
         computeEdgeWeightsBlockDiaCsr_V2<IndexType, ValueType, float>,
         cudaFuncCachePreferL1);
-    computeEdgeWeightsBlockDiaCsr_V2<<<num_blocks_nz_orig, threads_per_block, 0, str>>>(
-        A.row_offsets.raw(), row_indices_orig.raw(), A.col_indices.raw(),
+    computeEdgeWeightsBlockDiaCsr_V2<IndexType, ValueType, float>
+        <<<num_blocks_nz_orig, threads_per_block, 0, str>>>(
+        A.row_offsets.raw(), (const IndexType *)row_indices_orig.raw(), A.col_indices.raw(),
         A.diag.raw(), A.values.raw(),
         num_nonzero_blk, edge_weights_orig.raw(), /*rand_edge_weights=*/nullptr,
         num_block_rows, A.get_block_dimy(),
@@ -634,8 +667,8 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                 thrust::cuda::par.on(str),
                 status_vec.begin(), status_vec.begin() + n_cur,
                 status_vec.begin(),
-                [] __device__(int s) { return MIS_ROOT; },
-                [] __device__(int s) { return s == MIS_UNDECIDED; });
+                SetMISRoot(),
+                IsUndecided());
             cudaCheckError();
         }
 
@@ -746,7 +779,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                 edge_weights_cur_ptr->begin(),
                 edge_weights_cur_ptr->begin() + nnz_cur,
                 A_scalar.values.begin(),
-                [] __device__(float v) { return (ValueType)v; });
+                FloatToValueType<ValueType>());
             cudaCheckError();
             A_scalar.resize(n_cur, n_cur, nnz_cur, 1, 1, false);
             A_scalar.set_initialized(1);
@@ -794,7 +827,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                 A_coarse.values.begin(),
                 A_coarse.values.begin() + nnz_coarse,
                 edge_weights_coarse.begin(),
-                [] __device__(ValueType v) { return fabsf((float)v); });
+                AbsToFloat<ValueType>());
             cudaCheckError();
 
             A_cur_ptr            = &A_coarse;
