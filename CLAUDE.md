@@ -26,88 +26,39 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 
 ---
 
-## Verification Procedure
+## Verification Procedure (Validated 2026-05-11)
 
-The goal is to match the AMGX SA solver algorithm as closely as possible to
-PETSc GAMG, then compare per-level grid sizes, eigenvalue estimates, and
-convergence rates on the same problem.
+**Status**: ✅ AMGx SA matches PETSc GAMG exactly (71 iterations, identical P nnz)
 
-### Problem: 200×200 2D Poisson (40,000 DOFs)
+Full details: see `plans/testing_setup.md`
 
-### Step 1: Run PETSc GAMG reference
+### Quick Run (Perlmutter)
 
 ```bash
-cd ~/Codes/petsc/src/ksp/ksp/tutorials
-./ex2 -m 200 -n 200 \
-      -ksp_type richardson -pc_type gamg \
-      -pc_gamg_aggressive_coarsening 1 \
-      -ksp_monitor -ksp_view -ksp_rtol 1e-5
+salloc -N 1 -C gpu -q interactive -t 00:30:00 -A m1516_g
+cd ~/amgx-sa/build_perlmutter
+bash ~/amgx-sa/scripts/run_mg_diag_compare.sh
 ```
 
-GAMG defaults used:
-- Smoother: Chebyshev(2) + Jacobi (not L1 Jacobi), pre+post
-- Eigenvalue estimate: CG-based, transform [0, 0.1; 0, 1.1]
-  → lmin = 0.1 × rho(D⁻¹A), lmax = 1.1 × rho(D⁻¹A)
-  → equivalent to lmin_denom = 10
-- Aggressive coarsening: 1 level (to match AMGX MULTI_PAIRWISE coarsening ratio)
-- Tolerance: rtol = 1e-5
+This runs PETSc (exports aggregates) then AMGx (imports same aggregates), comparing:
+- 100×100 2D Poisson, MIS-k(2) aggregation, 1429 coarse DOFs
+- Richardson + Jacobi-L1 smoother, 2-level V-cycle, coarse LU
+- SA smoothing: omega = (4/3)/rho(D^{-1}A) with 100 power iterations
 
-### Step 2: Run AMGX SA reference
+### Key Result
+
+| Metric | PETSc | AMGx |
+|--------|-------|------|
+| Iterations | 71 | 71 |
+| P nnz | 23,705 | 23,705 |
+| P_tent ‖·‖_F | 3.780211634287129e+01 | 3.780211634287129e+01 |
+
+### Matrix Verification
 
 ```bash
-cd ~/amgx-sa
-export LD_LIBRARY_PATH=~/amgx-sa/build_perlmutter:$LD_LIBRARY_PATH
-srun -n1 --gpus-per-task=1 -A m1516_g --qos=debug -C gpu -t 5:00 \
-  ./build_perlmutter/test_sa_phase1 build_perlmutter/poisson2d_200.mtx
+module load python
+python3 ~/amgx-sa/scripts/verify_sa_matrices.py .
 ```
-
-AMGX config (`AGGREGATION_SA_CHEBY.json`):
-- Smoother: CHEBYSHEV + BLOCK_JACOBI, order=2, pre=1, post=1
-- Eigenvalue: lambda_mode=4 (reuse SA rho), lmin_denom=10
-- Selector: MULTI_PAIRWISE (aggregation_passes=3)
-- Coarse solver: DENSE_LU_SOLVER
-- min_coarse_rows: 10
-- Tolerance: 1e-5
-
-### Step 3: Compare
-
-For each level, compare:
-1. **#equations** — should be similar
-2. **nnz/row** — proxy for operator cost per level
-3. **rho(D⁻¹A)** — AMGX `[SA-VIEW]` prints this; GAMG `-ksp_view` shows "eigenvalues provided"
-4. **λ_max, λ_min** — AMGX `[Chebyshev]` prints these; GAMG shows "eigenvalue targets used"
-5. **Convergence rate** — compute from last few residual norms: r_{k+1}/r_k
-6. **Iteration count** — should be within ~50% of each other
-
-### Matching the smoother algorithm
-
-| Parameter | PETSc GAMG default | AMGX SA config |
-|-----------|-------------------|----------------|
-| Smoother type | Chebyshev | CHEBYSHEV |
-| Preconditioner | Jacobi (diagonal) | BLOCK_JACOBI |
-| Chebyshev degree | 2 (mg_levels_ksp_max_it) | chebyshev_polynomial_order=2 |
-| Pre-smoothing | 1 call × 2 iters | presweeps=1 × order=2 |
-| Post-smoothing | 1 call × 2 iters | postsweeps=1 × order=2 |
-| λ_max estimate | CG-based rho(D⁻¹A) | SA power iteration rho(D⁻¹A) |
-| λ_max scaling | ×1.1 | ×1.1 (lambda_mode=4) |
-| λ_min | λ_max_provided × 0.1 | lmax / lmin_denom (=10) |
-| Coarse solver | LU | DENSE_LU_SOLVER |
-| Aggregation | MIS-k | MULTI_PAIRWISE (3 passes) |
-
-### Diagnostic output to check
-
-**AMGX `[SA-VIEW]` lines** (from `aggregation_amg_level.cu`):
-```
-[SA-VIEW] Level 0: #eqs=40000  avg_nnz/row=5.0
-[SA-VIEW] Level 0: rho(D^{-1}A)=1.846  omega=0.759
-```
-
-**AMGX `[Chebyshev]` lines** (from `cheb_solver.cu`):
-```
-[Chebyshev] level=40000  lambda_mode=4  lmax=2.030  lmin=0.203  lmin_denom=10  sa_eig_set=1
-```
-- `sa_eig_set=1` confirms the SA rho was passed to the smoother
-- `lmax = rho × 1.1`, `lmin = lmax / 10`
 
 ---
 
@@ -117,10 +68,10 @@ For each level, compare:
 cd ~/amgx-sa/build_perlmutter
 # Interactive GPU node required:
 salloc -N1 -C gpu --gpus=1 -A m1516_g --qos=debug -t 30:00
-srun -n1 --gpus-per-task=1 ./test_sa_phase1 poisson2d_200.mtx
+./test_mg_diag poisson2d.mtx
 ```
 
-Test binary source: `examples/test_sa_phase1.c`
+Test binary source: `examples/test_mg_diag.c`
 
 ---
 

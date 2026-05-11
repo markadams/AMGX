@@ -172,9 +172,12 @@ class Aggregation_AMG_Level_Base : public AMG_Level<T_Config>
         // and assembles P_tent as a CSR matrix stored in m_P_tent.
         void buildTentativeProlongator();
 
-        // Estimate spectral radius of D^{-1}A via power iteration.
-        // Returns the damping factor omega = 4 / (3 * rho(D^{-1}A)).
-        ValueTypeB estimateSADampingFactor(int max_iter = 20);
+        // Estimate spectral radius of D^{-1}A via power iteration (default: 100 steps).
+        // Returns the SA damping factor omega = (4/3) / rho(D^{-1}A).
+        // 100 iterations is needed to converge rho accurately (e.g. rho~1.97 for
+        // the 100x100 Poisson problem); fewer iterations underestimate rho and
+        // produce a wrong omega.
+        ValueTypeB estimateSADampingFactor(int max_iter = 100);
 
         // Smooth the tentative prolongator: P = (I - omega * D^{-1} * A) * P_tent.
         // Uses pattern-preserving SA (same sparsity as P_tent).

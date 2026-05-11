@@ -1992,7 +1992,64 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseVertices()
     //Set the aggregates
     // Pass level index to selector via matrix parameter (used by MIS selector for aggressive_levels)
     this->getA().template setParameter<int>("amg_level_index", this->getLevelIndex());
-    this->m_selector->setAggregates(this->getA(), this->m_aggregates, this->m_aggregates_fine_idx, this->m_num_aggregates);
+
+    // -----------------------------------------------------------------------
+    // Cross-aggregate test: import aggregates from file (env: AMGX_IMPORT_AGGREGATES)
+    // If set and this is level 0, read a flat text file instead of running the selector.
+    // File format: comment lines starting with '#', then N on one line, then N integers.
+    // -----------------------------------------------------------------------
+    const char *import_file = getenv("AMGX_IMPORT_AGGREGATES");
+    if (import_file && this->getLevelIndex() == 0)
+    {
+        int num_nodes = this->getA().get_num_rows();
+        FILE *fp = fopen(import_file, "r");
+        if (!fp)
+            FatalError("AMGX_IMPORT_AGGREGATES: cannot open file", AMGX_ERR_IO);
+
+        char line[256];
+        // Skip comment lines (lines starting with '#')
+        while (fgets(line, sizeof(line), fp) && line[0] == '#') {}
+        // First non-comment line is N
+        int file_n = atoi(line);
+        if (file_n != num_nodes)
+        {
+            fclose(fp);
+            FatalError("AMGX_IMPORT_AGGREGATES: N in file does not match matrix size", AMGX_ERR_BAD_PARAMETERS);
+        }
+
+        std::vector<int> h_agg(num_nodes);
+        int max_agg = -1;
+        for (int i = 0; i < num_nodes; i++)
+        {
+            if (!fgets(line, sizeof(line), fp))
+            {
+                fclose(fp);
+                FatalError("AMGX_IMPORT_AGGREGATES: file too short", AMGX_ERR_IO);
+            }
+            h_agg[i] = atoi(line);
+            if (h_agg[i] > max_agg) max_agg = h_agg[i];
+        }
+        fclose(fp);
+
+        this->m_num_aggregates = max_agg + 1;
+        this->m_aggregates.resize(num_nodes + this->getA().get_num_cols() - num_nodes);
+        cudaMemcpy(this->m_aggregates.raw(), h_agg.data(),
+                   num_nodes * sizeof(int), cudaMemcpyHostToDevice);
+
+        // m_aggregates_fine_idx: identity mapping (first fine node per aggregate)
+        // The selector normally fills this; we set it to identity for compatibility.
+        this->m_aggregates_fine_idx.resize(num_nodes);
+        amgx::thrust::sequence(this->m_aggregates_fine_idx.begin(),
+                               this->m_aggregates_fine_idx.end());
+
+        amgx_printf("[CROSS-AGG] Imported %d aggregates for %d nodes from %s\n",
+                    this->m_num_aggregates, num_nodes, import_file);
+    }
+    else
+    {
+        // Normal path: compute aggregates via selector
+        this->m_selector->setAggregates(this->getA(), this->m_aggregates, this->m_aggregates_fine_idx, this->m_num_aggregates);
+    }
 
     // ----------------------------------------------------------
     // Diagnostic: aggregate size histogram
@@ -2044,6 +2101,37 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseVertices()
                         min_sz, avg_sz, max_sz,
                         hist[0], hist[1], hist[2], hist[3],
                         hist[4], hist[5], hist[6], hist[7]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-aggregate test: export aggregates to file (env: AMGX_EXPORT_AGGREGATES)
+    // If set and this is level 0, write the flat text file after aggregation.
+    // -----------------------------------------------------------------------
+    {
+        const char *export_file = getenv("AMGX_EXPORT_AGGREGATES");
+        if (export_file && this->getLevelIndex() == 0)
+        {
+            int num_nodes = this->getA().get_num_rows();
+            std::vector<int> h_agg(num_nodes);
+            cudaMemcpy(h_agg.data(), this->m_aggregates.raw(),
+                       num_nodes * sizeof(int), cudaMemcpyDeviceToHost);
+            FILE *fp = fopen(export_file, "w");
+            if (fp)
+            {
+                fprintf(fp, "# Source: AMGx\n");
+                fprintf(fp, "# num_aggregates = %d\n", this->m_num_aggregates);
+                fprintf(fp, "%d\n", num_nodes);
+                for (int i = 0; i < num_nodes; i++)
+                    fprintf(fp, "%d\n", h_agg[i]);
+                fclose(fp);
+                amgx_printf("[CROSS-AGG] Exported %d aggregates for %d nodes to %s\n",
+                            this->m_num_aggregates, num_nodes, export_file);
+            }
+            else
+            {
+                amgx_printf("[CROSS-AGG] WARNING: could not open %s for writing\n", export_file);
+            }
         }
     }
 
@@ -2204,13 +2292,118 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
     }
     // --- Dump A, P, Ac to files for Python verification (finest level only) ---
 
-    // [SA-VIEW] Print per-level stats for the fine operator A
+    // [SA-VIEW] Print per-level stats for the fine operator A and coarse operator Ac
     {
         int nr  = A.get_num_rows();
         int nnz = A.get_num_nz();
         double avg_nnz = (nr > 0) ? (double)nnz / nr : 0.0;
-        printf("[SA-VIEW] Level %d: #eqs=%d  avg_nnz/row=%.1f\n",
-               this->getLevelIndex(), nr, avg_nnz);
+        int nc     = Ac.get_num_rows();
+        int nnz_c  = Ac.get_num_nz();
+        double avg_nnz_c = (nc > 0) ? (double)nnz_c / nc : 0.0;
+        printf("[SA-VIEW] Level %d: #eqs=%d  avg_nnz/row=%.1f  -->  coarse #eqs=%d  avg_nnz/row=%.1f\n",
+               this->getLevelIndex(), nr, avg_nnz, nc, avg_nnz_c);
+        fflush(stdout);
+    }
+
+    // [SA-VIEW] Diagnostic norms for P, P^T, Ac (SA path only)
+    if (m_null_dim > 0 && m_P_tent.get_num_rows() > 0)
+    {
+        typedef typename types::PODTypes<ValueTypeB>::type PodB;
+        // Compute ||P||_F (Frobenius norm of smoothed prolongator)
+        {
+            int p_nnz = m_P_tent.get_num_nz();
+            int p_rows = m_P_tent.get_num_rows();
+            int p_cols = m_P_tent.get_num_cols();
+            std::vector<ValueTypeB> h_pvals(p_nnz);
+            cudaMemcpy(h_pvals.data(), m_P_tent.values.raw(),
+                       p_nnz * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            double p_frob_sq = 0.0;
+            double p_max = 0.0;
+            double p_min = 1e30;
+            for (int i = 0; i < p_nnz; i++)
+            {
+                PodB a = types::util<ValueTypeB>::abs(h_pvals[i]);
+                double ad = (double)a;
+                p_frob_sq += ad * ad;
+                if (ad > p_max) p_max = ad;
+                if (ad > 0 && ad < p_min) p_min = ad;
+            }
+            printf("[SA-VIEW] P: %d x %d, nnz=%d, ||P||_F=%.6e, max|P_ij|=%.6e, min|P_ij|=%.6e\n",
+                   p_rows, p_cols, p_nnz, std::sqrt(p_frob_sq), p_max, p_min);
+        }
+        // Compute ||Ac||_F and diagonal stats
+        {
+            int ac_nnz = Ac.get_num_nz();
+            int ac_rows = Ac.get_num_rows();
+            std::vector<ValueTypeB> h_acvals(ac_nnz);
+            cudaMemcpy(h_acvals.data(), Ac.values.raw(),
+                       ac_nnz * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            // Also get diagonal indices
+            std::vector<int> h_diag(ac_rows);
+            cudaMemcpy(h_diag.data(), Ac.diag.raw(),
+                       ac_rows * sizeof(int), cudaMemcpyDeviceToHost);
+            double ac_frob_sq = 0.0;
+            double ac_diag_min = 1e30;
+            double ac_diag_max = 0.0;
+            double ac_diag_sum = 0.0;
+            for (int i = 0; i < ac_nnz; i++)
+            {
+                PodB a = types::util<ValueTypeB>::abs(h_acvals[i]);
+                ac_frob_sq += (double)a * (double)a;
+            }
+            for (int i = 0; i < ac_rows; i++)
+            {
+                if (h_diag[i] >= 0 && h_diag[i] < ac_nnz)
+                {
+                    PodB d = types::util<ValueTypeB>::abs(h_acvals[h_diag[i]]);
+                    double dd = (double)d;
+                    ac_diag_sum += dd;
+                    if (dd < ac_diag_min) ac_diag_min = dd;
+                    if (dd > ac_diag_max) ac_diag_max = dd;
+                }
+            }
+            printf("[SA-VIEW] Ac: %d x %d, nnz=%d, ||Ac||_F=%.6e\n",
+                   ac_rows, ac_rows, ac_nnz, std::sqrt(ac_frob_sq));
+            printf("[SA-VIEW] Ac diag: min=%.6e, max=%.6e, avg=%.6e\n",
+                   ac_diag_min, ac_diag_max,
+                   (ac_rows > 0) ? ac_diag_sum / ac_rows : 0.0);
+        }
+        // Compute ||A||_F and diagonal stats for comparison
+        {
+            int a_nnz = A.get_num_nz();
+            int a_rows = A.get_num_rows();
+            std::vector<ValueTypeB> h_avals(a_nnz);
+            cudaMemcpy(h_avals.data(), A.values.raw(),
+                       a_nnz * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            std::vector<int> h_diag(a_rows);
+            cudaMemcpy(h_diag.data(), A.diag.raw(),
+                       a_rows * sizeof(int), cudaMemcpyDeviceToHost);
+            double a_frob_sq = 0.0;
+            double a_diag_min = 1e30;
+            double a_diag_max = 0.0;
+            double a_diag_sum = 0.0;
+            for (int i = 0; i < a_nnz; i++)
+            {
+                PodB a = types::util<ValueTypeB>::abs(h_avals[i]);
+                a_frob_sq += (double)a * (double)a;
+            }
+            for (int i = 0; i < a_rows; i++)
+            {
+                if (h_diag[i] >= 0 && h_diag[i] < a_nnz)
+                {
+                    PodB d = types::util<ValueTypeB>::abs(h_avals[h_diag[i]]);
+                    double dd = (double)d;
+                    a_diag_sum += dd;
+                    if (dd < a_diag_min) a_diag_min = dd;
+                    if (dd > a_diag_max) a_diag_max = dd;
+                }
+            }
+            printf("[SA-VIEW] A:  %d x %d, nnz=%d, ||A||_F=%.6e\n",
+                   a_rows, a_rows, a_nnz, std::sqrt(a_frob_sq));
+            printf("[SA-VIEW] A  diag: min=%.6e, max=%.6e, avg=%.6e\n",
+                   a_diag_min, a_diag_max,
+                   (a_rows > 0) ? a_diag_sum / a_rows : 0.0);
+        }
         fflush(stdout);
     }
     Ac.setColsReorderedByColor(false);
@@ -3138,11 +3331,15 @@ void apply_point_dinv_kernel(
 // estimateSADampingFactor
 // ---------------------------------------------------------------
 //
-// Returns the SA damping factor omega = 1.4 / rho(D^{-1}A).
+// Returns the SA damping factor omega = (4/3) / rho(D^{-1}A).
 // Uses power iteration to estimate rho(D^{-1}A): the spectral radius
 // of the Jacobi-preconditioned operator.  Starting from a vector of
 // ones, each iteration applies A then D^{-1} and tracks the Rayleigh
 // quotient.  Convergence is typically reached in 10-20 iterations.
+//
+// Note: PETSc GAMG uses omega = 4/(3*rho) by default (same formula).
+// The constant 4/3 ≈ 1.333 is the optimal damping for SA prolongator
+// smoothing on model problems (Baker et al., 2011).
 
 template <class T_Config>
 typename T_Config::VecPrec
@@ -3224,21 +3421,26 @@ Aggregation_AMG_Level_Base<T_Config>::estimateSADampingFactor(int max_iter)
         }
     }
 
-    // omega = 1.4 / rho(D^{-1}A)
+    // omega = (4/3) / rho(D^{-1}A)  -- classic SA prolongator smoothing factor
+    // (Baker et al., 2011).  PETSc GAMG uses the same formula with the same
+    // constant, so both solvers produce identical omega given the same rho.
     PodB lambda_pod = static_cast<PodB>(types::util<ValueTypeB>::abs(lambda));
     ValueTypeB omega = types::util<ValueTypeB>::get_one();
+    static const PodB omega_num = static_cast<PodB>(4.0 / 3.0);
     if (lambda_pod > (PodB)0.0)
     {
-        PodB omega_pod = static_cast<PodB>(1.4) / lambda_pod;
+        PodB omega_pod = omega_num / lambda_pod;
         omega = omega * omega_pod;
     }
 
-
-    // [SA-VIEW] Print eigenvalue estimate for this level
-    printf("[SA-VIEW] Level %d: rho(D^{-1}A)=%.4g  omega=%.4g\n",
-           this->getLevelIndex(), (double)lambda_pod,
-           (lambda_pod > (PodB)0.0) ? (double)(1.4 / lambda_pod) : 0.0);
-    fflush(stdout);
+    // [SA-VIEW] Print eigenvalue estimate and SA prolongator smoothing omega.
+    {
+        double rho_d   = (double)lambda_pod;
+        double omega_d = (lambda_pod > (PodB)0.0) ? (double)(omega_num / lambda_pod) : 0.0;
+        printf("[SA-VIEW] Level %d: rho(D^{-1}A)=%.4g  omega_SA=(4/3)/rho=%.4g\n",
+               this->getLevelIndex(), rho_d, omega_d);
+        fflush(stdout);
+    }
     return omega;
 }
 
@@ -3503,15 +3705,16 @@ void Aggregation_AMG_Level_Base<T_Config>::smoothProlongator()
     int num_rows       = A.get_num_rows();   // node-level rows
     int num_dofs       = num_rows * block_size;
 
-    // Estimate damping factor omega = 1.4 / rho(D^{-1}A)
+    // Estimate damping factor omega = (4/3) / rho(D^{-1}A)
     ValueTypeB omega_b = estimateSADampingFactor();
     typedef typename types::PODTypes<ValueTypeB>::type PodB;
     PodB omega_pod = types::util<ValueTypeB>::abs(omega_b);
 
-    // Store rho(D^{-1}A) = 1.4 / omega for use by the Chebyshev smoother (lambda_mode=4).
-    // omega_pod = 1.4 / rho, so rho = 1.4 / omega_pod.
+    // Store rho(D^{-1}A) for use by the Chebyshev smoother (lambda_mode=4).
+    // estimateSADampingFactor returns omega = (4/3) / rho, so rho = (4/3) / omega.
+    static const double omega_num_d = 4.0 / 3.0;
     if (omega_pod > (PodB)0.0)
-        m_sa_rho = static_cast<double>(1.4 / omega_pod);
+        m_sa_rho = omega_num_d / static_cast<double>(omega_pod);
     else
         m_sa_rho = 0.0;
 
