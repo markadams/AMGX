@@ -18,34 +18,6 @@
 
 #include <amgx_types/util.h>
 
-// ---- MG-DIAG: Diagnostic norm prints for comparing with PETSc GAMG ----
-// Set AMGX_MG_DIAG=1 to enable at compile time, or always enabled for now.
-#ifndef AMGX_MG_DIAG
-#define AMGX_MG_DIAG 1
-#endif
-
-#if AMGX_MG_DIAG
-#include <cmath>
-#include <vector>
-// Helper: compute 2-norm of a device vector by copying to host (avoids template linkage issues)
-template <typename VVector>
-static double mg_diag_norm2(const VVector &v)
-{
-    int n = v.size();
-    if (n == 0) return 0.0;
-    typedef typename VVector::value_type VT;
-    typedef typename amgx::types::PODTypes<VT>::type PodT;
-    std::vector<VT> h_raw(n);
-    cudaMemcpy(h_raw.data(), v.raw(), n * sizeof(VT), cudaMemcpyDeviceToHost);
-    double sum = 0.0;
-    for (int i = 0; i < n; i++)
-    {
-        PodT a = amgx::types::util<VT>::abs(h_raw[i]);
-        sum += (double)a * (double)a;
-    }
-    return std::sqrt(sum);
-}
-#endif
 
 namespace amgx
 {
@@ -69,14 +41,6 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
     int levelnum = A.template getParameter <int>("level");
     int *smoothing_direction = nullptr;
 
-#if AMGX_MG_DIAG
-    // Static iteration counter — only print for first 5 outer iterations
-    static int mg_diag_iter = 0;
-    bool mg_diag_print = level->isFinest() && (mg_diag_iter < 5);
-    if (level->isFinest()) mg_diag_iter++;
-    int mg_diag_it = mg_diag_iter;  // capture current iteration number
-#endif
-
     if (!(A.hasParameter("smoothing_direction")) )
     {
         smoothing_direction = new int;
@@ -88,16 +52,6 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
     }
 
     A.setView(OWNED);
-
-#if AMGX_MG_DIAG
-    if (mg_diag_print)
-    {
-        double nb = mg_diag_norm2(b);
-        double nx = mg_diag_norm2(x);
-        amgx_printf("[MG-DIAG] iter=%d level=%d ENTRY  ||b||=%.15e  ||x||=%.15e  n=%d\n",
-                     mg_diag_it, levelnum, nb, nx, (int)b.size());
-    }
-#endif
 
     if (this->isASolvable(A))
     {
@@ -157,15 +111,6 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
         }
         level->Profile.toc("Smoother");
 
-#if AMGX_MG_DIAG
-        if (mg_diag_print)
-        {
-            double nx = mg_diag_norm2(x);
-            amgx_printf("[MG-DIAG] iter=%d level=%d AFTER-PRESMOOTH  ||x||=%.15e\n",
-                         mg_diag_it, levelnum, nx);
-        }
-#endif
-
         if ( level->isCoarsest() && amg->getCoarseSolver(MemorySpace()) != NULL)
             // Only one level with coarse solver
         {
@@ -186,14 +131,6 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
             axmb(A, x, b, r, offset, size);
             level->Profile.toc("ComputeResidual");
 
-#if AMGX_MG_DIAG
-            if (mg_diag_print)
-            {
-                double nr = mg_diag_norm2(r);
-                amgx_printf("[MG-DIAG] iter=%d level=%d AFTER-RESIDUAL  ||r||=%.15e\n",
-                             mg_diag_it, levelnum, nr);
-            }
-#endif
             //apply restriction
             // in classical the current level is consolidated while in aggregation this is the next one.
             // Hence, in classical, given a level L, if we want to consolidate L+1 vectors (ie coarse vectors of L) we have to look at L+1 flags.
@@ -214,15 +151,6 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
             level->Profile.tic("restrictRes");
             level->restrictResidual(r, bc);
             level->Profile.toc("restrictRes");
-
-#if AMGX_MG_DIAG
-            if (mg_diag_print)
-            {
-                double nbc = mg_diag_norm2(bc);
-                amgx_printf("[MG-DIAG] iter=%d level=%d AFTER-RESTRICT  ||bc||=%.15e  bc.size=%d\n",
-                             mg_diag_it, levelnum, nbc, (int)bc.size());
-            }
-#endif
 
             // we have to be very carreful with !A.is_matrix_singleGPU() by A.is_matrix_distributed().
             // In classical consolidation we want to use A.is_matrix_distributed() in order to consolidateVector / unconsolidateVector
@@ -260,27 +188,10 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
                 level->unconsolidateVector(xc);
             }
 
-#if AMGX_MG_DIAG
-            if (mg_diag_print)
-            {
-                double nxc = mg_diag_norm2(xc);
-                amgx_printf("[MG-DIAG] iter=%d level=%d AFTER-COARSE-SOLVE  ||xc||=%.15e  xc.size=%d\n",
-                             mg_diag_it, levelnum, nxc, (int)xc.size());
-            }
-#endif
-
             //prolongate correction
             level->prolongateAndApplyCorrection(xc, bc, x, r);
             level->Profile.toc("proCorr");
 
-#if AMGX_MG_DIAG
-            if (mg_diag_print)
-            {
-                double nx = mg_diag_norm2(x);
-                amgx_printf("[MG-DIAG] iter=%d level=%d AFTER-PROLONGATE  ||x||=%.15e\n",
-                             mg_diag_it, levelnum, nx);
-            }
-#endif
             //post smooth
             *smoothing_direction = 1;
             level->Profile.tic("Smoother");
@@ -315,24 +226,6 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
                 }
             }
             level->Profile.toc("Smoother");
-
-#if AMGX_MG_DIAG
-            if (mg_diag_print)
-            {
-                double nx = mg_diag_norm2(x);
-                // Also compute final residual norm for comparison with PETSc
-                VVector r_diag;
-                r_diag.set_block_dimy(b.get_block_dimy());
-                r_diag.set_block_dimx(1);
-                r_diag.resize(b.size());
-                int off2, sz2;
-                A.getOffsetAndSizeForView(OWNED, &off2, &sz2);
-                axmb(A, x, b, r_diag, off2, sz2);
-                double nr_final = mg_diag_norm2(r_diag);
-                amgx_printf("[MG-DIAG] iter=%d level=%d AFTER-POSTSMOOTH  ||x||=%.15e  ||r_final||=%.15e\n",
-                             mg_diag_it, levelnum, nx, nr_final);
-            }
-#endif
 
             if ( (!A.is_matrix_singleGPU()) && (!level->isClassicalAMGLevel()) && consolidation_flag )
             {
