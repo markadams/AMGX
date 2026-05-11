@@ -60,10 +60,20 @@
 
 ## Current Phase: MIS-k Development
 
-### 🔲 Native MIS Aggregation Baseline
-- Run test drivers without AMGX_IMPORT_AGGREGATES (uses AMGx MIS-2)
-- Record iteration counts as baseline for MIS-k comparison
-- Iteration counts will differ from GAMG-imported case (different aggregates)
+### ✅ Native MIS Aggregation Baseline (2026-05-11)
+- All solvers converge with AMGx native MIS-2 aggregation (no GAMG import)
+- Iteration counts (native MIS-2 vs GAMG-imported):
+
+| Test | Solver | Smoother | Native MIS-2 | GAMG Import |
+|------|--------|----------|:------------:|:-----------:|
+| test_mg_diag | Richardson | Jacobi-L1 | **136** | 71 |
+| test_cg_sa | CG | Jacobi-L1 | **30** | 22 |
+| test_cheby_sa | Richardson | Chebyshev(1)+Jacobi | **82** | 42 |
+| test_cheby_pcg_sa | CG | Chebyshev(1)+Jacobi | **23** | 17 |
+
+- Higher iteration counts expected: MIS-2 produces different (larger) aggregates than GAMG
+- All converge to rtol=1e-8, confirming SA-AMG implementation is correct
+- These are the baseline for MIS-k development
 
 ### 🔲 MIS-k MPI-Parallel Implementation
 - See `plans/mis_k_mpi_parallel_plan.md`
