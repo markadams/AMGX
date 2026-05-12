@@ -72,7 +72,7 @@ static const char *PCG_CHEBY_MULTILEVEL_CONFIG =
     "      \"selector\": \"MIS\","
     "      \"mis_k\": 2,"
     "      \"aggressive_levels\": 1,"
-    "      \"max_aggregate_size\": 10,"
+    "      \"max_aggregate_size\": 6,"
     "      \"refine_threshold\": 0.0,"
     "      \"merge_singletons\": 1,"
     "      \"coarse_solver\": \"DENSE_LU_SOLVER\","
