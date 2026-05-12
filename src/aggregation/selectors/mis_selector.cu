@@ -1143,13 +1143,11 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                 num_block_rows, d_reassigned.raw());
             cudaCheckError();
 
-            // Split: peel off one boundary node per oversized aggregate
-            split_oversized_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
-                A.row_offsets.raw(), A.col_indices.raw(),
-                aggregates.raw(), agg_sizes.raw(),
-                this->m_max_aggregate_size,
-                num_block_rows, refine_iter, d_reassigned.raw());
-            cudaCheckError();
+            // NOTE: split_oversized_kernel removed — it created singleton
+            // aggregates (aggregates[tid]=tid) that are pathologically small
+            // and disjointed, leading to dense coarse matrices and crashes.
+            // The refine_aggregates_kernel above handles reassignment to
+            // existing smaller neighbors without creating new aggregates.
 
             int h_reassigned = 0;
             cudaMemcpyAsync(&h_reassigned, d_reassigned.raw(), sizeof(int),
