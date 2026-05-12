@@ -2058,6 +2058,11 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
     // for complex types, sizeof(ValueTypeB) == 2 * sizeof(PODType).
     if (m_null_dim > 0 && sizeof(ValueTypeB) == sizeof(typename types::PODTypes<ValueTypeB>::type))
     {
+        amgx_printf("[SA-DEBUG] Level %d: SA path entered. A: %d rows, %d nnz, block=%d, "
+                    "null_dim=%d, num_aggregates=%d, near_null_space.size=%d\n",
+                    this->getLevelIndex(), (int)A.get_num_rows(), (int)A.get_num_nz(),
+                    (int)A.get_block_dimy(), m_null_dim, m_num_aggregates,
+                    (int)m_near_null_space.size());
         // SA path: build P_tent via QR, smooth it, then use for RAP
         // === Compact aggregate IDs to remove gaps ===
         // The selector may produce non-contiguous aggregate IDs (e.g., 0, 2, 5, 7
@@ -2086,8 +2091,14 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
                 m_num_aggregates = num_unique;
             }
         }
+        amgx_printf("[SA-DEBUG] Level %d: calling buildTentativeProlongator\n", this->getLevelIndex());
         buildTentativeProlongator();
+        amgx_printf("[SA-DEBUG] Level %d: buildTentativeProlongator done. P_tent: %d x %d, nnz=%d\n",
+                    this->getLevelIndex(), (int)m_P_tent.get_num_rows(), (int)m_P_tent.get_num_cols(),
+                    (int)m_P_tent.get_num_nz());
+        amgx_printf("[SA-DEBUG] Level %d: calling smoothProlongator\n", this->getLevelIndex());
         smoothProlongator();
+        amgx_printf("[SA-DEBUG] Level %d: smoothProlongator done\n", this->getLevelIndex());
 
         // Pass the SA-computed rho(D^{-1}A) to the Chebyshev smoother so that
         // lambda_mode=4 can reuse it instead of running a separate power iteration.
@@ -2143,9 +2154,17 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
     // which is incorrect for SA.  CSR_Multiply::csr_galerkin_product handles real-valued P.
     if (m_null_dim > 0 && m_P_tent.get_num_rows() > 0)
     {
+        amgx_printf("[SA-DEBUG] Level %d: Galerkin product P^T*A*P. P_tent_T: %dx%d nnz=%d, "
+                    "A: %dx%d nnz=%d, P_tent: %dx%d nnz=%d\n",
+                    this->getLevelIndex(),
+                    (int)m_P_tent_T.get_num_rows(), (int)m_P_tent_T.get_num_cols(), (int)m_P_tent_T.get_num_nz(),
+                    (int)A.get_num_rows(), (int)A.get_num_cols(), (int)A.get_num_nz(),
+                    (int)m_P_tent.get_num_rows(), (int)m_P_tent.get_num_cols(), (int)m_P_tent.get_num_nz());
         CSR_Multiply<TConfig>::csr_galerkin_product(
             m_P_tent_T, A, m_P_tent, Ac,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        amgx_printf("[SA-DEBUG] Level %d: Galerkin product done. Ac: %dx%d nnz=%d\n",
+                    this->getLevelIndex(), (int)Ac.get_num_rows(), (int)Ac.get_num_cols(), (int)Ac.get_num_nz());
     }
     else
     {
