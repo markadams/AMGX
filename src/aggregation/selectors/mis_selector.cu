@@ -497,15 +497,16 @@ void compute_max_edge_weight_kernel(const IndexType *row_offsets,
 // Kernel: refine_aggregates_kernel (REVISED)
 //
 // For nodes in oversized aggregates (size > max_agg_size):
-//   1. Find the best neighbor in a SMALLER aggregate OR one below the size cap
+//   1. Find the best neighbor aggregate that is below the size cap
 //      using score = edge_weight / target_agg_size
-//   2. If no such neighbor exists and the aggregate is significantly oversized
-//      (> 1.5x cap), a limited fraction of boundary nodes become singletons
-//      to seed new aggregates for subsequent iterations.
+//   2. If no below-cap neighbor exists, find the smallest neighbor aggregate
+//      and move there only if it's at least 2 smaller (prevents oscillation)
+//   3. If the aggregate is oversized and the node is the one with
+//      tid == my_agg (the "root"), it stays put to maintain aggregate identity
 //
-// The combined condition (smaller OR below cap) handles both cases:
-// - When some aggregates are below cap: nodes move there (original behavior)
-// - When all are oversized: nodes move to the smallest neighbors
+// When all aggregates are uniformly oversized, the singleton creation
+// (rate-limited) seeds new small aggregates that attract nodes in
+// subsequent iterations.
 // -----------------------------------------------------------------------
 template <typename IndexType>
 __global__
@@ -526,8 +527,8 @@ void refine_aggregates_kernel(
     {
         int my_agg = aggregates[tid];
         int my_size = (my_agg >= 0) ? agg_sizes[my_agg] : 0;
-        // Only process nodes in oversized aggregates
-        if (my_agg >= 0 && my_size > max_agg_size)
+        // Only process nodes in oversized aggregates; skip the root node
+        if (my_agg >= 0 && my_size > max_agg_size && tid != my_agg)
         {
             float threshold = max_edge_weight[tid] * alpha;
             float best_score = -1.0f;
@@ -550,8 +551,8 @@ void refine_aggregates_kernel(
                 {
                     int jagg_size = agg_sizes[jagg];
                     has_diff_neighbor = true;
-                    // Move to aggregate that is SMALLER than ours OR below the cap
-                    if (jagg_size < my_size || jagg_size < max_agg_size)
+                    // Move to aggregate below the cap, OR significantly smaller
+                    if (jagg_size < max_agg_size || jagg_size + 2 <= my_size)
                     {
                         float score = w / (float)(jagg_size + 1);
                         if (score > best_score)
@@ -569,12 +570,13 @@ void refine_aggregates_kernel(
                 aggregates[tid] = best_agg;
                 atomicAdd(num_reassigned, 1);
             }
-            else if (has_diff_neighbor && my_size > max_agg_size + max_agg_size / 2)
+            else if (has_diff_neighbor && my_size > max_agg_size)
             {
-                // Aggregate is severely oversized (> 1.5x cap) and no better
-                // neighbor exists. Rate-limit: only ~1 in 8 eligible nodes
-                // becomes a singleton to avoid over-fragmentation.
-                if ((tid & 7) == 0)
+                // No better neighbor found but aggregate is oversized.
+                // Become a singleton — but rate-limit to avoid fragmentation.
+                // Only 1 in (my_size) eligible nodes splits off per iteration,
+                // targeting ~1 node per oversized aggregate.
+                if ((tid % my_size) == 1)
                 {
                     aggregates[tid] = tid;
                     atomicAdd(num_reassigned, 1);
