@@ -497,16 +497,11 @@ void compute_max_edge_weight_kernel(const IndexType *row_offsets,
 // Kernel: refine_aggregates_kernel (REVISED)
 //
 // For nodes in oversized aggregates (size > max_agg_size):
-//   1. Find the best neighbor aggregate that is below the size cap
-//      using score = edge_weight / target_agg_size
-//   2. If no below-cap neighbor exists, find the smallest neighbor aggregate
-//      and move there only if it's at least 2 smaller (prevents oscillation)
-//   3. If the aggregate is oversized and the node is the one with
-//      tid == my_agg (the "root"), it stays put to maintain aggregate identity
+//   Find the best neighbor aggregate that is below the size cap
+//   using score = edge_weight / (target_agg_size + 1).
+//   Also allow moves to any aggregate that is strictly smaller than ours.
 //
-// When all aggregates are uniformly oversized, the singleton creation
-// (rate-limited) seeds new small aggregates that attract nodes in
-// subsequent iterations.
+// The root node (tid == my_agg) is never moved to preserve aggregate identity.
 // -----------------------------------------------------------------------
 template <typename IndexType>
 __global__
@@ -533,7 +528,6 @@ void refine_aggregates_kernel(
             float threshold = max_edge_weight[tid] * alpha;
             float best_score = -1.0f;
             int   best_agg   = -1;
-            bool  has_diff_neighbor = false;
 
             int jmin = row_offsets[tid];
             int jmax = row_offsets[tid + 1];
@@ -550,9 +544,8 @@ void refine_aggregates_kernel(
                 if (jagg >= 0 && jagg != my_agg)
                 {
                     int jagg_size = agg_sizes[jagg];
-                    has_diff_neighbor = true;
-                    // Move to aggregate below the cap, OR significantly smaller
-                    if (jagg_size < max_agg_size || jagg_size + 2 <= my_size)
+                    // Move to aggregate below the cap OR strictly smaller
+                    if (jagg_size < max_agg_size || jagg_size < my_size)
                     {
                         float score = w / (float)(jagg_size + 1);
                         if (score > best_score)
@@ -566,21 +559,61 @@ void refine_aggregates_kernel(
 
             if (best_agg >= 0)
             {
-                // Move to a better neighbor aggregate
                 aggregates[tid] = best_agg;
                 atomicAdd(num_reassigned, 1);
             }
-            else if (has_diff_neighbor && my_size > max_agg_size)
+        }
+        tid += gridDim.x * blockDim.x;
+    }
+}
+
+// -----------------------------------------------------------------------
+// Kernel: split_oversized_kernel
+//
+// For aggregates that are still oversized after refinement moves,
+// split off exactly one non-root boundary node per aggregate to create
+// a new singleton. This increases the aggregate count gradually.
+// The node chosen is the one with the lowest tid in the aggregate
+// that has a neighbor in a different aggregate (boundary node).
+// -----------------------------------------------------------------------
+template <typename IndexType>
+__global__
+void split_oversized_kernel(
+    const IndexType *row_offsets,
+    const IndexType *col_indices,
+    IndexType       *aggregates,
+    const int       *agg_sizes,
+    const int        max_agg_size,
+    const int        num_rows,
+    int             *num_split)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    while (tid < num_rows)
+    {
+        int my_agg = aggregates[tid];
+        // Only process non-root nodes in oversized aggregates
+        if (my_agg >= 0 && tid != my_agg && agg_sizes[my_agg] > max_agg_size)
+        {
+            // Check if this node is at an aggregate boundary
+            bool at_boundary = false;
+            int jmin = row_offsets[tid];
+            int jmax = row_offsets[tid + 1];
+            for (int j = jmin; j < jmax; j++)
             {
-                // No better neighbor found but aggregate is oversized.
-                // Become a singleton — but rate-limit to avoid fragmentation.
-                // Only 1 in (my_size) eligible nodes splits off per iteration,
-                // targeting ~1 node per oversized aggregate.
-                if ((tid % my_size) == 1)
+                int jcol = col_indices[j];
+                if (jcol < num_rows && aggregates[jcol] != my_agg)
                 {
-                    aggregates[tid] = tid;
-                    atomicAdd(num_reassigned, 1);
+                    at_boundary = true;
+                    break;
                 }
+            }
+
+            // Split: only the node with tid == my_agg + 1 splits off
+            // This ensures exactly one node per oversized aggregate splits
+            if (at_boundary && tid == my_agg + 1)
+            {
+                aggregates[tid] = tid;
+                atomicAdd(num_split, 1);
             }
         }
         tid += gridDim.x * blockDim.x;
@@ -1097,13 +1130,21 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                 aggregates.raw(), agg_sizes.raw(), num_block_rows);
             cudaCheckError();
 
-            // Reassign nodes from oversized aggregates
+            // Reassign nodes from oversized aggregates to smaller neighbors
             cudaMemsetAsync(d_reassigned.raw(), 0, sizeof(int), str);
             refine_aggregates_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
                 A.row_offsets.raw(), A.col_indices.raw(),
                 edge_weights_orig.raw(), max_ew_per_row.raw(),
                 aggregates.raw(), agg_sizes.raw(),
                 this->m_max_aggregate_size, alpha,
+                num_block_rows, d_reassigned.raw());
+            cudaCheckError();
+
+            // Split: peel off one boundary node per oversized aggregate
+            split_oversized_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+                A.row_offsets.raw(), A.col_indices.raw(),
+                aggregates.raw(), agg_sizes.raw(),
+                this->m_max_aggregate_size,
                 num_block_rows, d_reassigned.raw());
             cudaCheckError();
 
