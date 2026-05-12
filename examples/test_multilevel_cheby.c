@@ -77,7 +77,7 @@ static const char *PCG_CHEBY_MULTILEVEL_CONFIG =
     "      \"coarse_solver\": \"DENSE_LU_SOLVER\","
     "      \"max_iters\": 1,"
     "      \"min_coarse_rows\": 10,"
-    "      \"max_levels\": 20,"
+    "      \"max_levels\": 3,"
     "      \"cycle\": \"V\","
     "      \"print_solve_stats\": 0,"
     "      \"print_grid_stats\": 1,"
