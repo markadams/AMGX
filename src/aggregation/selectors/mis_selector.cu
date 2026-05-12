@@ -499,7 +499,6 @@ void compute_max_edge_weight_kernel(const IndexType *row_offsets,
 // For nodes in oversized aggregates (size > max_agg_size):
 //   Find the best neighbor aggregate that is below the size cap
 //   using score = edge_weight / (target_agg_size + 1).
-//   Also allow moves to any aggregate that is strictly smaller than ours.
 //
 // The root node (tid == my_agg) is never moved to preserve aggregate identity.
 // -----------------------------------------------------------------------
@@ -544,8 +543,8 @@ void refine_aggregates_kernel(
                 if (jagg >= 0 && jagg != my_agg)
                 {
                     int jagg_size = agg_sizes[jagg];
-                    // Move to aggregate below the cap OR strictly smaller
-                    if (jagg_size < max_agg_size || jagg_size < my_size)
+                    // Only move to aggregates below the size cap
+                    if (jagg_size < max_agg_size)
                     {
                         float score = w / (float)(jagg_size + 1);
                         if (score > best_score)
@@ -570,11 +569,11 @@ void refine_aggregates_kernel(
 // -----------------------------------------------------------------------
 // Kernel: split_oversized_kernel
 //
-// For aggregates that are still oversized after refinement moves,
-// split off exactly one non-root boundary node per aggregate to create
-// a new singleton. This increases the aggregate count gradually.
-// The node chosen is the one with the lowest tid in the aggregate
-// that has a neighbor in a different aggregate (boundary node).
+// For aggregates still oversized after refinement, split off boundary nodes
+// to create new singletons. Uses a deterministic selection: for each
+// oversized aggregate, the boundary node whose (tid % agg_size) == iter
+// becomes a singleton. This splits off ~1 node per oversized aggregate
+// per call, controlled by the iter parameter.
 // -----------------------------------------------------------------------
 template <typename IndexType>
 __global__
@@ -585,35 +584,39 @@ void split_oversized_kernel(
     const int       *agg_sizes,
     const int        max_agg_size,
     const int        num_rows,
+    const int        iter,
     int             *num_split)
 {
     int tid = threadIdx.x + blockDim.x * blockIdx.x;
     while (tid < num_rows)
     {
         int my_agg = aggregates[tid];
+        int my_size = (my_agg >= 0) ? agg_sizes[my_agg] : 0;
         // Only process non-root nodes in oversized aggregates
-        if (my_agg >= 0 && tid != my_agg && agg_sizes[my_agg] > max_agg_size)
+        if (my_agg >= 0 && tid != my_agg && my_size > max_agg_size)
         {
-            // Check if this node is at an aggregate boundary
-            bool at_boundary = false;
-            int jmin = row_offsets[tid];
-            int jmax = row_offsets[tid + 1];
-            for (int j = jmin; j < jmax; j++)
+            // Deterministic selection: pick ~1 node per aggregate per iter
+            if ((tid % my_size) == (iter % my_size))
             {
-                int jcol = col_indices[j];
-                if (jcol < num_rows && aggregates[jcol] != my_agg)
+                // Verify this node is at an aggregate boundary
+                bool at_boundary = false;
+                int jmin = row_offsets[tid];
+                int jmax = row_offsets[tid + 1];
+                for (int j = jmin; j < jmax; j++)
                 {
-                    at_boundary = true;
-                    break;
+                    int jcol = col_indices[j];
+                    if (jcol < num_rows && aggregates[jcol] != my_agg)
+                    {
+                        at_boundary = true;
+                        break;
+                    }
                 }
-            }
 
-            // Split: only the node with tid == my_agg + 1 splits off
-            // This ensures exactly one node per oversized aggregate splits
-            if (at_boundary && tid == my_agg + 1)
-            {
-                aggregates[tid] = tid;
-                atomicAdd(num_split, 1);
+                if (at_boundary)
+                {
+                    aggregates[tid] = tid;
+                    atomicAdd(num_split, 1);
+                }
             }
         }
         tid += gridDim.x * blockDim.x;
@@ -1145,7 +1148,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                 A.row_offsets.raw(), A.col_indices.raw(),
                 aggregates.raw(), agg_sizes.raw(),
                 this->m_max_aggregate_size,
-                num_block_rows, d_reassigned.raw());
+                num_block_rows, refine_iter, d_reassigned.raw());
             cudaCheckError();
 
             int h_reassigned = 0;
