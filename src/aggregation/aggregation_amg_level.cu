@@ -2097,18 +2097,23 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
                     this->getLevelIndex(), (int)m_P_tent.get_num_rows(), (int)m_P_tent.get_num_cols(),
                     (int)m_P_tent.get_num_nz());
 
-        // Skip SA prolongator smoothing on dense coarse matrices to prevent
-        // catastrophic fill-in in the Galerkin product.  When avg_nnz/row is
-        // high, smoothing P = (I - omega*D^{-1}*A)*P_tent creates a dense P
-        // whose P^T*A*P product overflows hash tables in csr_galerkin_product.
-        // Threshold: 15 nnz/row.  SA smoothing on a matrix with k nnz/row
-        // creates P with ~k nnz/col, and P^T*A*P has ~k^2 nnz/row in Ac.
-        // For k=15: Ac has ~225 nnz/row (manageable).
-        // For k=50: Ac has ~2500 nnz/row (catastrophic fill-in).
-        const int sa_smooth_max_nnz_per_row = 15;
+        // Skip SA prolongator smoothing when it would cause catastrophic
+        // fill-in in the Galerkin product P^T*A*P.
+        //
+        // SA smoothing creates P = (I - omega*D^{-1}*A)*P_tent.  Each row of
+        // the smoothed P has ~avg_nnz entries (the sparsity of A).  The
+        // Galerkin product P^T*A*P then creates Ac with density that grows
+        // quadratically with avg_nnz.  For the fine grid (5 nnz/row), this
+        // is fine.  For coarse grids with higher density, the fill-in becomes
+        // catastrophic and overflows csr_galerkin_product hash tables.
+        //
+        // Empirical threshold: smooth only on the finest level (Level 0) or
+        // when avg_nnz/row <= 10.  This prevents the fill-in explosion while
+        // preserving SA quality on the fine grid where it matters most.
+        const int sa_smooth_max_avg_nnz = 10;
         int avg_nnz_per_row = (A.get_num_rows() > 0)
                               ? (int)(A.get_num_nz() / A.get_num_rows()) : 0;
-        if (avg_nnz_per_row < sa_smooth_max_nnz_per_row)
+        if (avg_nnz_per_row <= sa_smooth_max_avg_nnz)
         {
             amgx_printf("[SA-DEBUG] Level %d: calling smoothProlongator (avg_nnz/row=%d)\n",
                         this->getLevelIndex(), avg_nnz_per_row);
@@ -2117,10 +2122,9 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
         }
         else
         {
-            amgx_printf("[SA-DEBUG] Level %d: SKIPPING smoothProlongator (avg_nnz/row=%d > %d) "
-                        "— using unsmoothed P_tent to avoid fill-in explosion\n",
-                        this->getLevelIndex(), avg_nnz_per_row, sa_smooth_max_nnz_per_row);
-            // Still estimate rho for Chebyshev smoother even without smoothing P
+            amgx_printf("[SA-DEBUG] Level %d: SKIPPING smoothProlongator "
+                        "(avg_nnz/row=%d > %d) — using unsmoothed P_tent\n",
+                        this->getLevelIndex(), avg_nnz_per_row, sa_smooth_max_avg_nnz);
             m_sa_rho = 0.0;  // will trigger fallback in Chebyshev
         }
 
