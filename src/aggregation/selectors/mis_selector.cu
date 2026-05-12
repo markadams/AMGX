@@ -1076,7 +1076,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
             edge_weights_orig.raw(), max_ew_per_row.raw(), num_block_rows);
         cudaCheckError();
 
-        IVector_d agg_sizes(num_aggregates);
+        IVector_d agg_sizes(num_block_rows);
         IVector_d d_reassigned(1);
 
         for (int refine_iter = 0; refine_iter < max_refine_iters; refine_iter++)
