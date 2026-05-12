@@ -40,6 +40,10 @@
 #include <thrust/transform.h>
 #include <cusp/detail/format_utils.h>  // offsets_to_indices
 
+#include <vector>
+#include <cmath>
+#include <climits>
+
 namespace amgx
 {
 namespace aggregation
@@ -1331,6 +1335,45 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                     "%d aggregates (avg size %.1f)\n",
                     this->m_max_aggregate_size, alpha, num_aggregates,
                     (float)num_block_rows / (float)num_aggregates);
+    }
+
+    // Aggregate size statistics
+    {
+        IVector_d agg_sizes_stats(num_aggregates, 0);
+        const int num_blocks_stats = std::min(AMGX_GRID_MAX_SIZE,
+                                              (num_block_rows - 1) / threads_per_block + 1);
+        count_aggregate_sizes_kernel<<<num_blocks_stats, threads_per_block, 0, str>>>(
+            aggregates.raw(), agg_sizes_stats.raw(), num_block_rows);
+        cudaCheckError();
+
+        // Copy to host for statistics
+        std::vector<int> h_sizes(num_aggregates);
+        cudaMemcpy(h_sizes.data(), agg_sizes_stats.raw(),
+                   num_aggregates * sizeof(int), cudaMemcpyDeviceToHost);
+
+        int min_size = INT_MAX, max_size = 0;
+        double sum = 0.0, sum_sq = 0.0;
+        int hist[6] = {0}; // [0]=size 1, [1]=2-3, [2]=4-5, [3]=6-7, [4]=8-9, [5]=10+
+        for (int i = 0; i < num_aggregates; i++) {
+            int s = h_sizes[i];
+            if (s < min_size) min_size = s;
+            if (s > max_size) max_size = s;
+            sum += s;
+            sum_sq += (double)s * s;
+            if (s <= 1) hist[0]++;
+            else if (s <= 3) hist[1]++;
+            else if (s <= 5) hist[2]++;
+            else if (s <= 7) hist[3]++;
+            else if (s <= 9) hist[4]++;
+            else hist[5]++;
+        }
+        double avg = sum / num_aggregates;
+        double stddev = sqrt(sum_sq / num_aggregates - avg * avg);
+
+        amgx_printf("[MIS-k] Aggregate stats: n=%d, min=%d, max=%d, avg=%.2f, stddev=%.2f\n",
+                    num_aggregates, min_size, max_size, avg, stddev);
+        amgx_printf("[MIS-k] Size histogram: [1]=%d [2-3]=%d [4-5]=%d [6-7]=%d [8-9]=%d [10+]=%d\n",
+                    hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
     }
 
     if (effective_k > 1)
