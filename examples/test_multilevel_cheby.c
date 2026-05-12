@@ -71,6 +71,7 @@ static const char *PCG_CHEBY_MULTILEVEL_CONFIG =
     "      \"postsweeps\": 1,"
     "      \"selector\": \"MIS\","
     "      \"mis_k\": 2,"
+    "      \"mis2_algorithm\": 1,"
     "      \"aggressive_levels\": 1,"
     "      \"max_aggregate_size\": 0,"
     "      \"merge_singletons\": 1,"

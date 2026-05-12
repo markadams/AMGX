@@ -207,6 +207,7 @@ void find_mis_k2_kernel(const IndexType *row_offsets,
                         const float     *node_weights,
                         int             *status,
                         const int        num_rows,
+                        const int        total_rows,
                         int             *num_changed)
 {
     int tid = threadIdx.x + blockDim.x * blockIdx.x;
@@ -225,7 +226,7 @@ void find_mis_k2_kernel(const IndexType *row_offsets,
             for (int j = jmin; j < jmax && !dominated; j++)
             {
                 int jcol = col_indices[j];
-                if (jcol == tid || jcol >= num_rows) { continue; }
+                if (jcol == tid || jcol >= total_rows) { continue; }
 
                 int jstatus = status[jcol];
                 if (jstatus == MIS_ROOT)
@@ -243,25 +244,30 @@ void find_mis_k2_kernel(const IndexType *row_offsets,
                 }
 
                 // Check distance-2 neighbors (neighbors of jcol)
-                int kmin = row_offsets[jcol];
-                int kmax = row_offsets[jcol + 1];
-                for (int k = kmin; k < kmax && !dominated; k++)
+                // Only expand owned nodes (jcol < num_rows) since we don't
+                // have row_offsets for halo nodes
+                if (jcol < num_rows)
                 {
-                    int kcol = col_indices[k];
-                    if (kcol == tid || kcol == jcol || kcol >= num_rows) { continue; }
+                    int kmin = row_offsets[jcol];
+                    int kmax = row_offsets[jcol + 1];
+                    for (int k = kmin; k < kmax && !dominated; k++)
+                    {
+                        int kcol = col_indices[k];
+                        if (kcol == tid || kcol == jcol || kcol >= total_rows) { continue; }
 
-                    int kstatus = status[kcol];
-                    if (kstatus == MIS_ROOT)
-                    {
-                        dominated = true;
-                        break;
-                    }
-                    if (kstatus == MIS_UNDECIDED && is_max)
-                    {
-                        float kw = node_weights[kcol];
-                        if (kw > my_weight || (kw == my_weight && kcol > tid))
+                        int kstatus = status[kcol];
+                        if (kstatus == MIS_ROOT)
                         {
-                            is_max = false;
+                            dominated = true;
+                            break;
+                        }
+                        if (kstatus == MIS_UNDECIDED && is_max)
+                        {
+                            float kw = node_weights[kcol];
+                            if (kw > my_weight || (kw == my_weight && kcol > tid))
+                            {
+                                is_max = false;
+                            }
                         }
                     }
                 }
@@ -782,6 +788,163 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         this->m_weight_formula);
     cudaCheckError();
 
+    // ==================================================================
+    // Algorithm selection: implicit square graph MIS-2 vs Galerkin loop
+    // ==================================================================
+    if (this->m_mis2_algorithm == 1 && effective_k == 2)
+    {
+        // --------------------------------------------------------------
+        // Implicit square graph path (mis2_algorithm=1):
+        //   1. Run MIS-2 directly on the original graph
+        //   2. Assign aggregates using distance-1 connectivity only
+        //   3. Propagate to unassigned nodes
+        //   4. Renumber
+        //
+        // This produces smaller aggregates than Galerkin MIS-2 because
+        // distance-1 assignment only grabs immediate neighbors (~4 for
+        // 5-pt stencil) rather than the dense Galerkin neighborhood.
+        // --------------------------------------------------------------
+        amgx_printf("[MIS-k] Using implicit square graph MIS-2 (mis2_algorithm=1)\n");
+
+        const int num_blocks_fine = std::min(AMGX_GRID_MAX_SIZE,
+                                             (num_block_rows - 1) / threads_per_block + 1);
+
+        // Phase 1: Assign node weights
+        unsigned int seed = 0x9e3779b9u;
+        FVector_d node_weights(total_rows, 0.0f);
+        assign_node_weights_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+            num_block_rows, node_weights.raw(), seed);
+        cudaCheckError();
+
+        // Exchange node_weights halo for MPI
+        if (!A.is_matrix_singleGPU())
+        {
+            node_weights.dirtybit = 1;
+            A.manager->exchange_halo(node_weights, node_weights.tag);
+        }
+
+        // Phase 2: Run MIS-2 iteratively until converged
+        IVector_d status_vec(total_rows, MIS_UNDECIDED);
+        int *status_ptr = status_vec.raw();
+
+        IVector_d d_changed(1);
+        int *d_changed_ptr = d_changed.raw();
+
+        int num_undecided = num_block_rows;
+        int icount = 0;
+
+        while (num_undecided > 0 && icount < this->m_max_iterations)
+        {
+            cudaMemsetAsync(d_changed_ptr, 0, sizeof(int), str);
+
+            find_mis_k2_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+                A.row_offsets.raw(), A.col_indices.raw(),
+                node_weights.raw(), status_ptr,
+                num_block_rows, total_rows, d_changed_ptr);
+            cudaCheckError();
+
+            // Exchange status halo for MPI
+            if (!A.is_matrix_singleGPU())
+            {
+                status_vec.dirtybit = 1;
+                A.manager->exchange_halo(status_vec, status_vec.tag);
+            }
+
+            num_undecided = (int)thrust_wrapper::count<AMGX_device>(
+                status_vec.begin(), status_vec.begin() + num_block_rows,
+                MIS_UNDECIDED);
+            cudaCheckError();
+            icount++;
+        }
+
+        // Safety: remaining undecided become roots
+        if (num_undecided > 0)
+        {
+            thrust::transform_if(
+                thrust::cuda::par.on(str),
+                status_vec.begin(), status_vec.begin() + num_block_rows,
+                status_vec.begin(),
+                SetMISRoot(),
+                IsUndecided());
+            cudaCheckError();
+        }
+
+        int n_roots_mis = (int)thrust_wrapper::count<AMGX_device>(
+            status_vec.begin(), status_vec.begin() + num_block_rows, MIS_ROOT);
+        cudaCheckError();
+        amgx_printf("[MIS-k] Implicit MIS-2: converged in %d iters, "
+                    "%d roots out of %d nodes (%.1f%%), %d forced-root\n",
+                    icount, n_roots_mis, num_block_rows,
+                    100.0f * n_roots_mis / num_block_rows,
+                    num_undecided);
+
+        // Phase 3: Assign non-MIS nodes to strongest root neighbor (distance-1)
+        assign_aggregates_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+            A.row_offsets.raw(), A.col_indices.raw(),
+            edge_weights_orig.raw(), status_ptr,
+            aggregates.raw(), num_block_rows);
+        cudaCheckError();
+
+        // Phase 4: Propagate to unassigned nodes
+        int num_unassigned = (int)thrust_wrapper::count<AMGX_device>(
+            aggregates.begin(), aggregates.begin() + num_block_rows, -1);
+        cudaCheckError();
+
+        if (num_unassigned > 0)
+        {
+            if (!this->m_merge_singletons)
+            {
+                make_singletons_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+                    aggregates.raw(), num_block_rows);
+                cudaCheckError();
+            }
+            else
+            {
+                IVector_d agg_candidate(num_block_rows, -1);
+
+                while (num_unassigned > 0)
+                {
+                    thrust_wrapper::fill<AMGX_device>(
+                        agg_candidate.begin(), agg_candidate.end(), -1);
+
+                    propagate_aggregates_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+                        A.row_offsets.raw(), A.col_indices.raw(),
+                        edge_weights_orig.raw(), aggregates.raw(),
+                        agg_candidate.raw(), num_block_rows, /*deterministic=*/1);
+                    cudaCheckError();
+
+                    join_candidates_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+                        aggregates.raw(), agg_candidate.raw(), num_block_rows);
+                    cudaCheckError();
+
+                    int prev_unassigned = num_unassigned;
+                    num_unassigned = (int)thrust_wrapper::count<AMGX_device>(
+                        aggregates.begin(), aggregates.begin() + num_block_rows, -1);
+                    cudaCheckError();
+
+                    if (num_unassigned == prev_unassigned)
+                    {
+                        make_singletons_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+                            aggregates.raw(), num_block_rows);
+                        cudaCheckError();
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Phase 5: Renumber aggregates
+        this->renumberAndCountAggregates(aggregates, aggregates_global,
+                                         num_block_rows, num_aggregates);
+
+        amgx_printf("[MIS-k] Implicit MIS-2: %d fine nodes -> %d aggregates "
+                    "(avg size %.1f, net coarsening ratio %.2fx)\n",
+                    num_block_rows, num_aggregates,
+                    (float)num_block_rows / (float)num_aggregates,
+                    (float)num_block_rows / (float)num_aggregates);
+    }
+    else
+    {
     // ------------------------------------------------------------------
     // Galerkin coarsening loop
     //
@@ -1177,6 +1340,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                     num_block_rows, num_aggregates,
                     (float)num_block_rows / (float)num_aggregates);
     }
+    } // end else (Galerkin path)
 }
 
 // -----------------------------------------------------------------------
