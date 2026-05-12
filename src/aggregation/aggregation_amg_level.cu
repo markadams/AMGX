@@ -2101,8 +2101,11 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
         // catastrophic fill-in in the Galerkin product.  When avg_nnz/row is
         // high, smoothing P = (I - omega*D^{-1}*A)*P_tent creates a dense P
         // whose P^T*A*P product overflows hash tables in csr_galerkin_product.
-        // Threshold: 50 nnz/row (typical fine grids have 5-9, coarse ~15-30).
-        const int sa_smooth_max_nnz_per_row = 50;
+        // Threshold: 15 nnz/row.  SA smoothing on a matrix with k nnz/row
+        // creates P with ~k nnz/col, and P^T*A*P has ~k^2 nnz/row in Ac.
+        // For k=15: Ac has ~225 nnz/row (manageable).
+        // For k=50: Ac has ~2500 nnz/row (catastrophic fill-in).
+        const int sa_smooth_max_nnz_per_row = 15;
         int avg_nnz_per_row = (A.get_num_rows() > 0)
                               ? (int)(A.get_num_nz() / A.get_num_rows()) : 0;
         if (avg_nnz_per_row < sa_smooth_max_nnz_per_row)
