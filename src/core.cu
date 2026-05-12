@@ -475,6 +475,9 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("weight_formula", "choose the weight formula. 0: wij=0.5*(|a_ij|+|aji|)/max(|a_ii|,|a_jj|). 1: wij=-0.5(a_ij/a_ii + a_ji/a_jj) <0>", 0);
     AMG_Config::registerParameter<int>("mis_k", "for selector=MIS: distance parameter k (1=standard MIS, 2=aggressive coarsening) <1>", 1);
     AMG_Config::registerParameter<int>("aggressive_levels", "for selector=MIS: number of levels to use mis_k (0=all levels, N=first N levels use mis_k, rest use k=1) <1>", 1);
+    AMG_Config::registerParameter<int>("max_aggregate_size", "for selector=MIS: max aggregate size for quality refinement (0=no limit) <0>", 0);
+    AMG_Config::registerParameter<double>("refine_threshold", "for selector=MIS: weak edge threshold as fraction of max edge weight per row for refinement <0.1>", 0.1, 0.0, 1.0);
+    AMG_Config::registerParameter<int>("mis2_algorithm", "for selector=MIS with mis_k=2: 0=Galerkin loop, 1=implicit square graph <0>", 0);
     AMG_Config::registerParameter<int>("aggregation_passes", "for selector=MULTI_PAIRWISE: each pass about doubles the size of each aggregate", 3);
     AMG_Config::registerParameter<int>("filter_weights", "for selector=MULTI_PAIRWISE: set to 1 to remove weak edges before building aggregates. <0>", 0);
     AMG_Config::registerParameter<double>("filter_weights_alpha", "for selector=MULTI_PAIRWISE: a weight is considered weak iff w_ij<alpha*sqrt(max{w_ik}*max{w_jl}). alpha has to be in range (0,1) <0.5>", 0.5, 0.0, 1.0);

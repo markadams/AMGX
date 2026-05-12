@@ -39,6 +39,9 @@ class MISSelectorBase : public Selector<T_Config>
         int m_weight_formula;     // Edge weight formula (0 or 1)
         int m_aggregation_edge_weight_component; // Block component for edge weights
         int m_call_count;         // Tracks which AMG level we're on (incremented per call)
+        int m_max_aggregate_size;    // Maximum aggregate size (0=no limit, triggers refinement)
+        double m_refine_threshold;   // Weak edge threshold fraction for refinement (0.0-1.0)
+        int m_mis2_algorithm;        // 0=Galerkin loop (default), 1=implicit square graph
 };
 
 // Specialization for host

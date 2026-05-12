@@ -440,6 +440,137 @@ void make_singletons_kernel(IndexType *aggregates, const int num_rows)
 }
 
 // -----------------------------------------------------------------------
+// Kernel: count_aggregate_sizes_kernel
+//
+// Counts how many nodes belong to each aggregate via atomicAdd.
+// agg_sizes must be pre-zeroed before launch.
+// -----------------------------------------------------------------------
+__global__
+void count_aggregate_sizes_kernel(const int *aggregates, int *agg_sizes,
+                                   const int num_rows)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    while (tid < num_rows)
+    {
+        int agg = aggregates[tid];
+        if (agg >= 0)
+        {
+            atomicAdd(&agg_sizes[agg], 1);
+        }
+        tid += gridDim.x * blockDim.x;
+    }
+}
+
+// -----------------------------------------------------------------------
+// Kernel: compute_max_edge_weight_kernel
+//
+// For each row, find the maximum edge weight among its off-diagonal entries.
+// Used to compute the per-row weak-edge threshold for quality refinement.
+// -----------------------------------------------------------------------
+template <typename IndexType>
+__global__
+void compute_max_edge_weight_kernel(const IndexType *row_offsets,
+                                     const IndexType *col_indices,
+                                     const float *edge_weights,
+                                     float *max_edge_weight,
+                                     const int num_rows)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    while (tid < num_rows)
+    {
+        float max_w = 0.0f;
+        int jmin = row_offsets[tid];
+        int jmax = row_offsets[tid + 1];
+        for (int j = jmin; j < jmax; j++)
+        {
+            int jcol = col_indices[j];
+            if (jcol == tid) continue;  // skip diagonal
+            float w = edge_weights[j];
+            if (w > max_w) max_w = w;
+        }
+        max_edge_weight[tid] = max_w;
+        tid += gridDim.x * blockDim.x;
+    }
+}
+
+// -----------------------------------------------------------------------
+// Kernel: refine_aggregates_kernel
+//
+// For nodes in oversized aggregates (size > max_agg_size), find a better
+// aggregate assignment using quality-aware scoring:
+//   score = edge_weight(i,j) / (agg_sizes[agg[j]] + 1)
+//
+// Skips weak edges (below alpha * max_edge_weight_for_row).
+// Only moves nodes TO aggregates that are below the size limit.
+// Race-free: each node independently decides its new aggregate.
+//
+// Safe for asymmetric matrices:
+// - Value asymmetry: edge weights are symmetric by formula
+// - Structural asymmetry: missing edges have weight 0, ignored
+// - Per-row threshold asymmetry: unilateral decision, no acceptance needed
+//
+// num_reassigned is incremented atomically for convergence detection.
+// -----------------------------------------------------------------------
+template <typename IndexType>
+__global__
+void refine_aggregates_kernel(
+    const IndexType *row_offsets,
+    const IndexType *col_indices,
+    const float     *edge_weights,
+    const float     *max_edge_weight,
+    IndexType       *aggregates,
+    const int       *agg_sizes,
+    const int        max_agg_size,
+    const float      alpha,
+    const int        num_rows,
+    int             *num_reassigned)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    while (tid < num_rows)
+    {
+        int my_agg = aggregates[tid];
+        // Only process nodes in oversized aggregates
+        if (my_agg >= 0 && agg_sizes[my_agg] > max_agg_size)
+        {
+            float threshold = max_edge_weight[tid] * alpha;
+            float best_score = -1.0f;
+            int   best_agg   = -1;
+
+            int jmin = row_offsets[tid];
+            int jmax = row_offsets[tid + 1];
+
+            for (int j = jmin; j < jmax; j++)
+            {
+                int jcol = col_indices[j];
+                if (jcol == tid || jcol >= num_rows) continue;
+
+                float w = edge_weights[j];
+                if (w < threshold) continue;  // skip weak edges
+
+                int jagg = aggregates[jcol];
+                if (jagg >= 0 && jagg != my_agg && agg_sizes[jagg] < max_agg_size)
+                {
+                    // Quality score: strong edge to small aggregate
+                    float score = w / (float)(agg_sizes[jagg] + 1);
+                    if (score > best_score)
+                    {
+                        best_score = score;
+                        best_agg = jagg;
+                    }
+                }
+            }
+
+            if (best_agg >= 0)
+            {
+                aggregates[tid] = best_agg;
+                atomicAdd(num_reassigned, 1);
+            }
+        }
+        tid += gridDim.x * blockDim.x;
+    }
+}
+
+// -----------------------------------------------------------------------
 // Constructor
 // -----------------------------------------------------------------------
 template<class T_Config>
@@ -452,6 +583,9 @@ MISSelectorBase<T_Config>::MISSelectorBase(AMG_Config &cfg, const std::string &c
     m_weight_formula = cfg.AMG_Config::template getParameter<int>("weight_formula", cfg_scope);
     m_aggregation_edge_weight_component = cfg.AMG_Config::template getParameter<int>("aggregation_edge_weight_component", cfg_scope);
     m_call_count = 0;
+    m_max_aggregate_size = cfg.AMG_Config::template getParameter<int>("max_aggregate_size", cfg_scope);
+    m_refine_threshold = cfg.AMG_Config::template getParameter<double>("refine_threshold", cfg_scope);
+    m_mis2_algorithm = cfg.AMG_Config::template getParameter<int>("mis2_algorithm", cfg_scope);
 }
 
 // -----------------------------------------------------------------------
@@ -905,6 +1039,77 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
     // Final renumber to produce contiguous 0..num_aggregates-1
     this->renumberAndCountAggregates(aggregates, aggregates_global,
                                      num_block_rows, num_aggregates);
+
+    // ------------------------------------------------------------------
+    // Quality-aware aggregate refinement
+    //
+    // After MIS-k produces initial aggregates, iteratively reassign nodes
+    // from oversized aggregates to smaller neighbors using a quality score
+    // that rewards strong edges and small target aggregates.
+    //
+    // Safe for asymmetric matrices: edge weights are symmetric by formula,
+    // structural asymmetry results in weight=0 (ignored), per-row threshold
+    // asymmetry is acceptable (unilateral decisions, no acceptance needed).
+    //
+    // MPI note: Currently only considers owned nodes (jcol < num_rows).
+    // For MPI, edge weights for halo columns are 0 (known limitation).
+    // ------------------------------------------------------------------
+    if (this->m_max_aggregate_size > 0 && effective_k > 1)
+    {
+        const float alpha = (float)this->m_refine_threshold;
+        const int max_refine_iters = 10;
+        const int num_blocks_fine = std::min(AMGX_GRID_MAX_SIZE,
+                                             (num_block_rows - 1) / threads_per_block + 1);
+
+        // Compute max edge weight per row (for threshold)
+        FVector_d max_ew_per_row(num_block_rows);
+        compute_max_edge_weight_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+            A.row_offsets.raw(), A.col_indices.raw(),
+            edge_weights_orig.raw(), max_ew_per_row.raw(), num_block_rows);
+        cudaCheckError();
+
+        IVector_d agg_sizes(num_aggregates);
+        IVector_d d_reassigned(1);
+
+        for (int refine_iter = 0; refine_iter < max_refine_iters; refine_iter++)
+        {
+            // Count aggregate sizes
+            thrust_wrapper::fill<AMGX_device>(
+                agg_sizes.begin(), agg_sizes.end(), 0);
+            count_aggregate_sizes_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+                aggregates.raw(), agg_sizes.raw(), num_block_rows);
+            cudaCheckError();
+
+            // Reassign nodes from oversized aggregates
+            cudaMemsetAsync(d_reassigned.raw(), 0, sizeof(int), str);
+            refine_aggregates_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+                A.row_offsets.raw(), A.col_indices.raw(),
+                edge_weights_orig.raw(), max_ew_per_row.raw(),
+                aggregates.raw(), agg_sizes.raw(),
+                this->m_max_aggregate_size, alpha,
+                num_block_rows, d_reassigned.raw());
+            cudaCheckError();
+
+            int h_reassigned = 0;
+            cudaMemcpyAsync(&h_reassigned, d_reassigned.raw(), sizeof(int),
+                            cudaMemcpyDeviceToHost, str);
+            cudaStreamSynchronize(str);
+
+            if (h_reassigned == 0) break;
+
+            amgx_printf("[MIS-k] Refine iter %d: reassigned %d nodes\n",
+                        refine_iter, h_reassigned);
+        }
+
+        // Re-renumber after refinement (some aggregates may be empty now)
+        this->renumberAndCountAggregates(aggregates, aggregates_global,
+                                         num_block_rows, num_aggregates);
+
+        amgx_printf("[MIS-k] After refinement (max_size=%d, threshold=%.2f): "
+                    "%d aggregates (avg size %.1f)\n",
+                    this->m_max_aggregate_size, alpha, num_aggregates,
+                    (float)num_block_rows / (float)num_aggregates);
+    }
 
     if (effective_k > 1)
     {
