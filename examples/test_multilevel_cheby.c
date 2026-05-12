@@ -53,7 +53,7 @@ static const char *PCG_CHEBY_MULTILEVEL_CONFIG =
     "      \"solver\": \"AMG\","
     "      \"smoother\": {"
     "        \"solver\": \"CHEBYSHEV\","
-    "        \"chebyshev_polynomial_order\": 4,"
+    "        \"chebyshev_polynomial_order\": 2,"
     "        \"chebyshev_lambda_estimate_mode\": 4,"
     "        \"chebyshev_lmin_denom\": 11.0,"
     "        \"preconditioner\": {"
