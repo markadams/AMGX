@@ -494,22 +494,17 @@ void compute_max_edge_weight_kernel(const IndexType *row_offsets,
 }
 
 // -----------------------------------------------------------------------
-// Kernel: refine_aggregates_kernel
+// Kernel: refine_aggregates_kernel (REVISED)
 //
-// For nodes in oversized aggregates (size > max_agg_size), find a better
-// aggregate assignment using quality-aware scoring:
-//   score = edge_weight(i,j) / (agg_sizes[agg[j]] + 1)
+// For nodes in oversized aggregates (size > max_agg_size):
+//   1. Find the best neighbor in a SMALLER aggregate (any size, not just < max)
+//      using score = edge_weight / target_agg_size
+//   2. If no smaller neighbor found, become a new singleton (aggregates[tid] = tid)
+//      BUT only if the node has at least one neighbor in a different aggregate
+//      (to avoid fragmenting connected components)
 //
-// Skips weak edges (below alpha * max_edge_weight_for_row).
-// Only moves nodes TO aggregates that are below the size limit.
-// Race-free: each node independently decides its new aggregate.
-//
-// Safe for asymmetric matrices:
-// - Value asymmetry: edge weights are symmetric by formula
-// - Structural asymmetry: missing edges have weight 0, ignored
-// - Per-row threshold asymmetry: unilateral decision, no acceptance needed
-//
-// num_reassigned is incremented atomically for convergence detection.
+// The "become singleton" behavior creates new aggregates that will attract
+// nearby nodes in subsequent iterations, effectively splitting large aggregates.
 // -----------------------------------------------------------------------
 template <typename IndexType>
 __global__
@@ -535,6 +530,7 @@ void refine_aggregates_kernel(
             float threshold = max_edge_weight[tid] * alpha;
             float best_score = -1.0f;
             int   best_agg   = -1;
+            bool  has_diff_neighbor = false;
 
             int jmin = row_offsets[tid];
             int jmax = row_offsets[tid + 1];
@@ -548,21 +544,33 @@ void refine_aggregates_kernel(
                 if (w < threshold) continue;  // skip weak edges
 
                 int jagg = aggregates[jcol];
-                if (jagg >= 0 && jagg != my_agg && agg_sizes[jagg] < max_agg_size)
+                if (jagg >= 0 && jagg != my_agg)
                 {
-                    // Quality score: strong edge to small aggregate
-                    float score = w / (float)(agg_sizes[jagg] + 1);
-                    if (score > best_score)
+                    has_diff_neighbor = true;
+                    // Move to any SMALLER aggregate (not just < max_agg_size)
+                    if (agg_sizes[jagg] < agg_sizes[my_agg])
                     {
-                        best_score = score;
-                        best_agg = jagg;
+                        float score = w / (float)(agg_sizes[jagg] + 1);
+                        if (score > best_score)
+                        {
+                            best_score = score;
+                            best_agg = jagg;
+                        }
                     }
                 }
             }
 
             if (best_agg >= 0)
             {
+                // Move to a smaller neighbor aggregate
                 aggregates[tid] = best_agg;
+                atomicAdd(num_reassigned, 1);
+            }
+            else if (has_diff_neighbor)
+            {
+                // No smaller neighbor found, but we're at an aggregate boundary
+                // Become a new singleton to seed a new aggregate
+                aggregates[tid] = tid;
                 atomicAdd(num_reassigned, 1);
             }
         }
