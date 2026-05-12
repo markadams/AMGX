@@ -478,6 +478,8 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("max_aggregate_size", "for selector=MIS: max aggregate size for quality refinement (0=no limit) <0>", 0);
     AMG_Config::registerParameter<double>("refine_threshold", "for selector=MIS: weak edge threshold as fraction of max edge weight per row for refinement <0.1>", 0.1, 0.0, 1.0);
     AMG_Config::registerParameter<int>("mis2_algorithm", "for selector=MIS with mis_k=2: 0=Galerkin loop, 1=implicit square graph <0>", 0);
+    AMG_Config::registerParameter<double>("strength_threshold", "for selector=MIS: edges with weight < threshold*max_row_weight are ignored during MIS selection (like PETSc -pc_gamg_threshold) <0.0>", 0.0, 0.0, 1.0);
+    AMG_Config::registerParameter<int>("mis_verbose", "for selector=MIS: print detailed aggregation diagnostics (0=quiet, 1=verbose) <0>", 0);
     AMG_Config::registerParameter<int>("aggregation_passes", "for selector=MULTI_PAIRWISE: each pass about doubles the size of each aggregate", 3);
     AMG_Config::registerParameter<int>("filter_weights", "for selector=MULTI_PAIRWISE: set to 1 to remove weak edges before building aggregates. <0>", 0);
     AMG_Config::registerParameter<double>("filter_weights_alpha", "for selector=MULTI_PAIRWISE: a weight is considered weak iff w_ij<alpha*sqrt(max{w_ik}*max{w_jl}). alpha has to be in range (0,1) <0.5>", 0.5, 0.0, 1.0);

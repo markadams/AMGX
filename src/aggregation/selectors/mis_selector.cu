@@ -100,7 +100,7 @@ struct AbsToFloat
 // using the hash_val() function from common_selector.h.
 // An optional seed offset allows different weights per Galerkin pass.
 // -----------------------------------------------------------------------
-__global__
+__global__ __launch_bounds__(256, 8)
 void assign_node_weights_kernel(const int num_rows, float *node_weights,
                                 unsigned int seed)
 {
@@ -131,10 +131,13 @@ void assign_node_weights_kernel(const int num_rows, float *node_weights,
 // atomicAdd into *num_changed.
 // -----------------------------------------------------------------------
 template <typename IndexType>
-__global__
+__global__ __launch_bounds__(256, 4)
 void find_mis_k1_kernel(const IndexType *row_offsets,
                         const IndexType *col_indices,
                         const float     *node_weights,
+                        const float     *edge_weights,
+                        const float     *max_row_weight,
+                        const float      strength_threshold,
                         int             *status,
                         const int        num_rows,
                         const int        total_rows,
@@ -149,6 +152,10 @@ void find_mis_k1_kernel(const IndexType *row_offsets,
             bool dominated  = false;   // a MIS_ROOT neighbor exists
             bool is_max     = true;    // highest weight among undecided neighbors
 
+            // Compute per-row threshold for strength filtering
+            float row_thresh = (strength_threshold > 0.0f && max_row_weight != nullptr)
+                             ? strength_threshold * max_row_weight[tid] : 0.0f;
+
             int jmin = row_offsets[tid];
             int jmax = row_offsets[tid + 1];
 
@@ -159,6 +166,10 @@ void find_mis_k1_kernel(const IndexType *row_offsets,
                 // covers owned + halo after exchange_halo; on single-GPU
                 // total_rows == num_rows so this is equivalent to the old guard)
                 if (jcol == tid || jcol >= total_rows) { continue; }
+
+                // Skip weak edges if strength threshold is active
+                if (row_thresh > 0.0f && edge_weights[j] < row_thresh)
+                { continue; }
 
                 int jstatus = status[jcol];
                 if (jstatus == MIS_ROOT)
@@ -205,10 +216,13 @@ void find_mis_k1_kernel(const IndexType *row_offsets,
 // Galerkin loop (which uses find_mis_k1_kernel exclusively).
 // -----------------------------------------------------------------------
 template <typename IndexType>
-__global__
+__global__ __launch_bounds__(256, 2)
 void find_mis_k2_kernel(const IndexType *row_offsets,
                         const IndexType *col_indices,
                         const float     *node_weights,
+                        const float     *edge_weights,
+                        const float     *max_row_weight,
+                        const float      strength_threshold,
                         int             *status,
                         const int        num_rows,
                         const int        total_rows,
@@ -223,6 +237,10 @@ void find_mis_k2_kernel(const IndexType *row_offsets,
             bool dominated  = false;
             bool is_max     = true;
 
+            // Compute per-row threshold for strength filtering
+            float row_thresh = (strength_threshold > 0.0f && max_row_weight != nullptr)
+                             ? strength_threshold * max_row_weight[tid] : 0.0f;
+
             int jmin = row_offsets[tid];
             int jmax = row_offsets[tid + 1];
 
@@ -231,6 +249,10 @@ void find_mis_k2_kernel(const IndexType *row_offsets,
             {
                 int jcol = col_indices[j];
                 if (jcol == tid || jcol >= total_rows) { continue; }
+
+                // Skip weak edges if strength threshold is active
+                if (row_thresh > 0.0f && edge_weights[j] < row_thresh)
+                { continue; }
 
                 int jstatus = status[jcol];
                 if (jstatus == MIS_ROOT)
@@ -252,12 +274,20 @@ void find_mis_k2_kernel(const IndexType *row_offsets,
                 // have row_offsets for halo nodes
                 if (jcol < num_rows)
                 {
+                    // Compute threshold for neighbor row
+                    float jrow_thresh = (strength_threshold > 0.0f && max_row_weight != nullptr)
+                                      ? strength_threshold * max_row_weight[jcol] : 0.0f;
+
                     int kmin = row_offsets[jcol];
                     int kmax = row_offsets[jcol + 1];
                     for (int k = kmin; k < kmax && !dominated; k++)
                     {
                         int kcol = col_indices[k];
                         if (kcol == tid || kcol == jcol || kcol >= total_rows) { continue; }
+
+                        // Skip weak edges at distance-2
+                        if (jrow_thresh > 0.0f && edge_weights[k] < jrow_thresh)
+                        { continue; }
 
                         int kstatus = status[kcol];
                         if (kstatus == MIS_ROOT)
@@ -301,10 +331,12 @@ void find_mis_k2_kernel(const IndexType *row_offsets,
 // Nodes with no MIS_ROOT neighbor remain at -1 (handled by propagation).
 // -----------------------------------------------------------------------
 template <typename IndexType>
-__global__
+__global__ __launch_bounds__(256, 4)
 void assign_aggregates_kernel(const IndexType *row_offsets,
                               const IndexType *col_indices,
                               const float     *edge_weights,
+                              const float     *max_row_weight,
+                              const float      strength_threshold,
                               const int       *status,
                               IndexType       *aggregates,
                               const int        num_rows)
@@ -321,6 +353,10 @@ void assign_aggregates_kernel(const IndexType *row_offsets,
             float best_weight = -1.0f;
             int   best_root   = -1;
 
+            // Compute per-row threshold for strength filtering
+            float row_thresh = (strength_threshold > 0.0f && max_row_weight != nullptr)
+                             ? strength_threshold * max_row_weight[tid] : 0.0f;
+
             int jmin = row_offsets[tid];
             int jmax = row_offsets[tid + 1];
 
@@ -328,6 +364,10 @@ void assign_aggregates_kernel(const IndexType *row_offsets,
             {
                 int jcol = col_indices[j];
                 if (jcol == tid || jcol >= num_rows) { continue; }
+
+                // Skip weak edges during assignment
+                if (row_thresh > 0.0f && edge_weights[j] < row_thresh)
+                { continue; }
 
                 if (status[jcol] == MIS_ROOT)
                 {
@@ -645,10 +685,11 @@ MISSelectorBase<T_Config>::MISSelectorBase(AMG_Config &cfg, const std::string &c
     m_merge_singletons = cfg.AMG_Config::template getParameter<int>("merge_singletons", cfg_scope);
     m_weight_formula = cfg.AMG_Config::template getParameter<int>("weight_formula", cfg_scope);
     m_aggregation_edge_weight_component = cfg.AMG_Config::template getParameter<int>("aggregation_edge_weight_component", cfg_scope);
-    m_call_count = 0;
     m_max_aggregate_size = cfg.AMG_Config::template getParameter<int>("max_aggregate_size", cfg_scope);
     m_refine_threshold = cfg.AMG_Config::template getParameter<double>("refine_threshold", cfg_scope);
     m_mis2_algorithm = cfg.AMG_Config::template getParameter<int>("mis2_algorithm", cfg_scope);
+    m_strength_threshold = cfg.AMG_Config::template getParameter<double>("strength_threshold", cfg_scope);
+    m_verbose = cfg.AMG_Config::template getParameter<int>("mis_verbose", cfg_scope);
 }
 
 // -----------------------------------------------------------------------
@@ -750,10 +791,13 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         effective_k = 1;
     }
 
-    amgx_printf("[MIS-k] Level %d: mis_k=%d, effective_k=%d "
-                "(aggressive_levels=%d)\n",
-                current_level, this->m_mis_k, effective_k,
-                this->m_aggressive_levels);
+    if (this->m_verbose)
+    {
+        amgx_printf("[MIS-k] Level %d: mis_k=%d, effective_k=%d "
+                    "(aggressive_levels=%d)\n",
+                    current_level, this->m_mis_k, effective_k,
+                    this->m_aggressive_levels);
+    }
 
     // ------------------------------------------------------------------
     // Initialize composed aggregation: R_out_agg[i] = i (identity)
@@ -808,10 +852,27 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         // distance-1 assignment only grabs immediate neighbors (~4 for
         // 5-pt stencil) rather than the dense Galerkin neighborhood.
         // --------------------------------------------------------------
-        amgx_printf("[MIS-k] Using implicit square graph MIS-2 (mis2_algorithm=1)\n");
+        if (this->m_verbose)
+            amgx_printf("[MIS-k] Using implicit square graph MIS-2 (mis2_algorithm=1)\n");
 
         const int num_blocks_fine = std::min(AMGX_GRID_MAX_SIZE,
                                              (num_block_rows - 1) / threads_per_block + 1);
+
+        // Compute per-row max edge weight for strength thresholding
+        float strength_thresh = (float)this->m_strength_threshold;
+        FVector_d max_row_weight_vec(num_block_rows, 0.0f);
+        float *max_row_weight_ptr = nullptr;
+        if (strength_thresh > 0.0f)
+        {
+            compute_max_edge_weight_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
+                A.row_offsets.raw(), A.col_indices.raw(),
+                edge_weights_orig.raw(), max_row_weight_vec.raw(),
+                num_block_rows);
+            cudaCheckError();
+            max_row_weight_ptr = max_row_weight_vec.raw();
+            if (this->m_verbose)
+                amgx_printf("[MIS-k] Strength threshold: %.4f\n", strength_thresh);
+        }
 
         // Phase 1: Assign node weights
         unsigned int seed = 0x9e3779b9u;
@@ -837,13 +898,17 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         int num_undecided = num_block_rows;
         int icount = 0;
 
+        cudaFuncSetCacheConfig(find_mis_k2_kernel<IndexType>, cudaFuncCachePreferL1);
+
         while (num_undecided > 0 && icount < this->m_max_iterations)
         {
             cudaMemsetAsync(d_changed_ptr, 0, sizeof(int), str);
 
             find_mis_k2_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
                 A.row_offsets.raw(), A.col_indices.raw(),
-                node_weights.raw(), status_ptr,
+                node_weights.raw(), edge_weights_orig.raw(),
+                max_row_weight_ptr, strength_thresh,
+                status_ptr,
                 num_block_rows, total_rows, d_changed_ptr);
             cudaCheckError();
 
@@ -876,16 +941,18 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         int n_roots_mis = (int)thrust_wrapper::count<AMGX_device>(
             status_vec.begin(), status_vec.begin() + num_block_rows, MIS_ROOT);
         cudaCheckError();
-        amgx_printf("[MIS-k] Implicit MIS-2: converged in %d iters, "
-                    "%d roots out of %d nodes (%.1f%%), %d forced-root\n",
-                    icount, n_roots_mis, num_block_rows,
-                    100.0f * n_roots_mis / num_block_rows,
-                    num_undecided);
+        if (this->m_verbose)
+            amgx_printf("[MIS-k] Implicit MIS-2: converged in %d iters, "
+                        "%d roots out of %d nodes (%.1f%%), %d forced-root\n",
+                        icount, n_roots_mis, num_block_rows,
+                        100.0f * n_roots_mis / num_block_rows,
+                        num_undecided);
 
         // Phase 3: Assign non-MIS nodes to strongest root neighbor (distance-1)
         assign_aggregates_kernel<<<num_blocks_fine, threads_per_block, 0, str>>>(
             A.row_offsets.raw(), A.col_indices.raw(),
-            edge_weights_orig.raw(), status_ptr,
+            edge_weights_orig.raw(), max_row_weight_ptr, strength_thresh,
+            status_ptr,
             aggregates.raw(), num_block_rows);
         cudaCheckError();
 
@@ -973,7 +1040,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         const int num_blocks_cur = std::min(AMGX_GRID_MAX_SIZE,
                                             (n_cur - 1) / threads_per_block + 1);
 
-        if (effective_k > 1)
+        if (effective_k > 1 && this->m_verbose)
         {
             amgx_printf("[MIS-k] Pass %d/%d: n_cur=%d, nnz=%d, avg_nnz/row=%.1f\n",
                         pass, effective_k, n_cur, nnz_cur_total,
@@ -986,6 +1053,20 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         // node_weights and status_vec are sized to total_cur (owned + halo)
         // so that exchange_halo can fill halo entries in-place.
         // ----------------------------------------------------------------
+
+        // Compute per-row max edge weight for strength thresholding
+        float strength_thresh = (float)this->m_strength_threshold;
+        FVector_d max_row_weight_vec(n_cur, 0.0f);
+        float *max_row_weight_ptr = nullptr;
+        if (strength_thresh > 0.0f)
+        {
+            compute_max_edge_weight_kernel<<<num_blocks_cur, threads_per_block, 0, str>>>(
+                A_cur.row_offsets.raw(), A_cur.col_indices.raw(),
+                edge_weights_cur_ptr->raw(), max_row_weight_vec.raw(),
+                n_cur);
+            cudaCheckError();
+            max_row_weight_ptr = max_row_weight_vec.raw();
+        }
 
         // Use a different hash seed per pass to decorrelate weights
         unsigned int seed = 0x9e3779b9u + (unsigned int)(pass * 0x6c62272eu);
@@ -1015,6 +1096,8 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         int num_undecided = n_cur;
         int icount = 0;
 
+        cudaFuncSetCacheConfig(find_mis_k1_kernel<IndexType>, cudaFuncCachePreferL1);
+
         while (num_undecided > 0 && icount < this->m_max_iterations)
         {
             cudaMemsetAsync(d_changed_ptr, 0, sizeof(int), str);
@@ -1023,7 +1106,9 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
             // the k-distance is achieved by iterating the loop effective_k times.
             find_mis_k1_kernel<<<num_blocks_cur, threads_per_block, 0, str>>>(
                 A_cur.row_offsets.raw(), A_cur.col_indices.raw(),
-                node_weights.raw(), status_ptr,
+                node_weights.raw(), edge_weights_cur_ptr->raw(),
+                max_row_weight_ptr, strength_thresh,
+                status_ptr,
                 n_cur, total_cur, d_changed_ptr);
             cudaCheckError();
 
@@ -1056,7 +1141,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         }
 
         // Diagnostic: count MIS roots for this pass
-        if (effective_k > 1)
+        if (effective_k > 1 && this->m_verbose)
         {
             int n_roots_mis = (int)thrust_wrapper::count<AMGX_device>(
                 status_vec.begin(), status_vec.begin() + n_cur, MIS_ROOT);
@@ -1075,7 +1160,8 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         IVector_d agg_cur(n_cur, -1);
         assign_aggregates_kernel<<<num_blocks_cur, threads_per_block, 0, str>>>(
             A_cur.row_offsets.raw(), A_cur.col_indices.raw(),
-            edge_weights_cur_ptr->raw(), status_ptr,
+            edge_weights_cur_ptr->raw(), max_row_weight_ptr, strength_thresh,
+            status_ptr,
             agg_cur.raw(), n_cur);
         cudaCheckError();
 
@@ -1138,7 +1224,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         int n_roots = 0;
         this->renumberAndCountAggregates(agg_cur, agg_global_cur, n_cur, n_roots);
 
-        if (effective_k > 1)
+        if (effective_k > 1 && this->m_verbose)
         {
             amgx_printf("[MIS-k] Pass %d: %d aggregates from %d nodes "
                         "(coarsening ratio %.2fx)\n",
@@ -1238,7 +1324,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
             A_cur_ptr            = &A_coarse;
             edge_weights_cur_ptr = &edge_weights_coarse;
 
-            if (effective_k > 1)
+            if (effective_k > 1 && this->m_verbose)
             {
                 int n_coarse = A_coarse.get_num_rows();
                 amgx_printf("[MIS-k] Pass %d: Galerkin coarse matrix: "
@@ -1323,21 +1409,24 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
 
             if (h_reassigned == 0) break;
 
-            amgx_printf("[MIS-k] Refine iter %d: reassigned %d nodes\n",
-                        refine_iter, h_reassigned);
+            if (this->m_verbose)
+                amgx_printf("[MIS-k] Refine iter %d: reassigned %d nodes\n",
+                            refine_iter, h_reassigned);
         }
 
         // Re-renumber after refinement (some aggregates may be empty now)
         this->renumberAndCountAggregates(aggregates, aggregates_global,
                                          num_block_rows, num_aggregates);
 
-        amgx_printf("[MIS-k] After refinement (max_size=%d, threshold=%.2f): "
-                    "%d aggregates (avg size %.1f)\n",
-                    this->m_max_aggregate_size, alpha, num_aggregates,
-                    (float)num_block_rows / (float)num_aggregates);
+        if (this->m_verbose)
+            amgx_printf("[MIS-k] After refinement (max_size=%d, threshold=%.2f): "
+                        "%d aggregates (avg size %.1f)\n",
+                        this->m_max_aggregate_size, alpha, num_aggregates,
+                        (float)num_block_rows / (float)num_aggregates);
     }
 
-    // Aggregate size statistics
+    // Aggregate size statistics (gated behind verbose flag to avoid D→H copy)
+    if (this->m_verbose)
     {
         IVector_d agg_sizes_stats(num_aggregates, 0);
         const int num_blocks_stats = std::min(AMGX_GRID_MAX_SIZE,
