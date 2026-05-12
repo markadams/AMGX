@@ -2096,9 +2096,30 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
         amgx_printf("[SA-DEBUG] Level %d: buildTentativeProlongator done. P_tent: %d x %d, nnz=%d\n",
                     this->getLevelIndex(), (int)m_P_tent.get_num_rows(), (int)m_P_tent.get_num_cols(),
                     (int)m_P_tent.get_num_nz());
-        amgx_printf("[SA-DEBUG] Level %d: calling smoothProlongator\n", this->getLevelIndex());
-        smoothProlongator();
-        amgx_printf("[SA-DEBUG] Level %d: smoothProlongator done\n", this->getLevelIndex());
+
+        // Skip SA prolongator smoothing on dense coarse matrices to prevent
+        // catastrophic fill-in in the Galerkin product.  When avg_nnz/row is
+        // high, smoothing P = (I - omega*D^{-1}*A)*P_tent creates a dense P
+        // whose P^T*A*P product overflows hash tables in csr_galerkin_product.
+        // Threshold: 50 nnz/row (typical fine grids have 5-9, coarse ~15-30).
+        const int sa_smooth_max_nnz_per_row = 50;
+        int avg_nnz_per_row = (A.get_num_rows() > 0)
+                              ? (int)(A.get_num_nz() / A.get_num_rows()) : 0;
+        if (avg_nnz_per_row < sa_smooth_max_nnz_per_row)
+        {
+            amgx_printf("[SA-DEBUG] Level %d: calling smoothProlongator (avg_nnz/row=%d)\n",
+                        this->getLevelIndex(), avg_nnz_per_row);
+            smoothProlongator();
+            amgx_printf("[SA-DEBUG] Level %d: smoothProlongator done\n", this->getLevelIndex());
+        }
+        else
+        {
+            amgx_printf("[SA-DEBUG] Level %d: SKIPPING smoothProlongator (avg_nnz/row=%d > %d) "
+                        "— using unsmoothed P_tent to avoid fill-in explosion\n",
+                        this->getLevelIndex(), avg_nnz_per_row, sa_smooth_max_nnz_per_row);
+            // Still estimate rho for Chebyshev smoother even without smoothing P
+            m_sa_rho = 0.0;  // will trigger fallback in Chebyshev
+        }
 
         // Pass the SA-computed rho(D^{-1}A) to the Chebyshev smoother so that
         // lambda_mode=4 can reuse it instead of running a separate power iteration.
