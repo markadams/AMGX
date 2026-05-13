@@ -88,6 +88,8 @@ A new `chebyshev_lambda_estimate_mode=4` that reuses the spectral radius compute
 
 The `lmin_denom=11` setting matches PETSc GAMG's default Chebyshev eigenvalue interval: `emax = 1.1*rho`, `emin = 0.1*rho = emax/11`.
 
+**Smoother choice**: Chebyshev/Jacobi damps optimally when you have a decent and conservative estimate of the max eigenvalue of `D⁻¹A`. When such an estimate is unavailable or unreliable, Richardson with Jacobi-L1 (`solver=JACOBI_L1`) is more robust — it requires no eigenvalue estimate and is unconditionally stable, at the cost of slightly slower convergence.
+
 ## Bug Fixes
 
 ### Chebyshev Solver: Zero Initial Guess
@@ -98,25 +100,20 @@ Fixed a bug in `src/solvers/cheb_solver.cu` where `solve_init()` did not zero th
 
 PCG + Chebyshev(1)+Jacobi smoother, V(1,1) cycle, rtol=1e-8, unpreconditioned residual norm.
 
-| Solver | Method | CG Iters | Aggregates | Avg Size | Grid Cx | Op Cx |
-|--------|--------|:--------:|:----------:|:--------:|:-------:|:-----:|
-| PETSc GAMG | MIS-2 (A^T*A + MIS-1) | 16 | 139,863 | 7.2 | 1.166 | 1.430 |
-| PETSc GAMG | MIS-2 (2xMIS-1 + Galerkin) | 18 | 147,053 | 6.8 | 1.176 | 1.493 |
-| AMGx-SA | MIS-2 (2xMIS-1 + Galerkin) | 27 | 105,204 | 9.5 | 1.124 | 1.337 |
-| **AMGx-SA** | **MIS-2 (implicit)** | **20** | **140,242** | **7.1** | **1.166** | **1.436** |
+| Solver | Method | Aggregates | Avg Size | Grid Cx | Op Cx | CG Iters | Work Cx |
+|--------|--------|:----------:|:--------:|:-------:|:-----:|:--------:|:-------:|
+| PETSc GAMG | MIS-2 (2xMIS-1 + Galerkin) | 147,053 | 6.8 | 1.176 | 1.493 | 18 | 26.9 |
+| AMGx-SA | MIS-2 (2xMIS-1 + Galerkin) | 105,204 | 9.5 | 1.124 | 1.337 | 27 | 36.1 |
+| PETSc GAMG | MIS-2 (A^T*A + MIS-1) | 139,863 | 7.2 | 1.166 | 1.430 | 16 | 22.9 |
+| **AMGx-SA** | **MIS-2 (implicit)** | **140,242** | **7.1** | **1.166** | **1.436** | **20** | **28.7** |
+
+Work Cx = CG Iters × Op Cx (total floating-point work relative to a single MatVec).
 
 The MIS-2 (implicit) algorithm matches PETSc's square graph aggregation quality (identical aggregate count and grid complexity) while being simpler to implement on GPU (no explicit A^T*A formation).
 
 ## Validation
 
 The SA-AMG implementation has been cross-validated against PETSc GAMG using identical aggregates (imported from PETSc). All solver/smoother combinations produce **identical iteration counts**:
-
-| Configuration | Iterations |
-|---------------|:----------:|
-| Richardson + Jacobi-L1 | 71 |
-| CG + Jacobi-L1 | 22 |
-| Richardson + Chebyshev(1)+Jacobi | 42 |
-| CG + Chebyshev(1)+Jacobi | 17 |
 
 ## Configuration Example
 
@@ -163,9 +160,10 @@ The SA-AMG implementation has been cross-validated against PETSc GAMG using iden
 | `mis_k` | 1 | MIS distance (1=standard, 2=aggressive coarsening) |
 | `mis2_algorithm` | 0 | MIS-2 algorithm: 0=Galerkin loop, 1=implicit |
 | `aggressive_levels` | 1 | Number of levels to use mis_k (0=all, N=first N levels) |
+| `strength_threshold` | 0.0 | Drop edges where \|a_ij\| < threshold × max_i \|a_ij\| (values 0–0.05 are common; 0.04 matches PETSc GAMG default) |
 | `merge_singletons` | 1 | Merge isolated nodes into neighbor aggregates |
 | `max_aggregate_size` | 0 | Max aggregate size for quality refinement (0=disabled) |
-| `refine_threshold` | 0.1 | Weak edge threshold fraction for refinement |
+| `refine_threshold` | 0.0 | Weak edge threshold fraction for refinement (0.05 recommended) |
 
 ## Test Drivers
 
