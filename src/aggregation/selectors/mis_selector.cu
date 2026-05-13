@@ -1023,10 +1023,11 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         this->renumberAndCountAggregates(aggregates, aggregates_global,
                                          num_block_rows, num_aggregates);
 
-        amgx_printf("[MIS-k] Implicit MIS-2: %d fine nodes -> %d aggregates "
-                    "(avg size %.1f, net coarsening ratio %.2fx)\n",
-                    num_block_rows, num_aggregates,
-                    (float)num_block_rows / (float)num_aggregates,
+        if (this->m_verbose)
+            amgx_printf("[MIS-k] Implicit MIS-2: %d fine nodes -> %d aggregates "
+                        "(avg size %.1f, net coarsening ratio %.2fx)\n",
+                        num_block_rows, num_aggregates,
+                        (float)num_block_rows / (float)num_aggregates,
                     (float)num_block_rows / (float)num_aggregates);
     }
     else
@@ -1469,7 +1470,7 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                     hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
     }
 
-    if (effective_k > 1)
+    if (effective_k > 1 && this->m_verbose)
     {
         amgx_printf("[MIS-k] Final: %d fine nodes -> %d aggregates "
                     "(net coarsening ratio %.2fx)\n",

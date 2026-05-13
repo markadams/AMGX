@@ -9,3 +9,8 @@ core/src/version.cu
 ci/docker/
 install
 Release
+
+# Development artifacts
+CLAUDE.md
+.clinerules
+plans/
