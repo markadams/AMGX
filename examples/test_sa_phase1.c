@@ -281,7 +281,7 @@ static const char *CHEBY2_JACOBI_SA_CONFIG =
     "        \"max_iters\": 1"
     "      },"
     "      \"max_iters\": 1,"
-    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_polynomial_order\": 1,"
     "      \"chebyshev_lambda_estimate_mode\": 3,"
     "      \"cheby_max_lambda\": 2.0,"
     "      \"cheby_min_lambda\": 0.2,"
@@ -324,7 +324,7 @@ static const char *CHEBY2_JACOBI_SA_DENSE_LU_CONFIG =
     "        \"max_iters\": 1"
     "      },"
     "      \"max_iters\": 1,"
-    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_polynomial_order\": 1,"
     "      \"chebyshev_lambda_estimate_mode\": 3,"
     "      \"cheby_max_lambda\": 2.0,"
     "      \"cheby_min_lambda\": 0.2,"
@@ -369,7 +369,7 @@ static const char *CHEBY2_JACOBI_SA_LM1_CONFIG =
     "        \"max_iters\": 1"
     "      },"
     "      \"max_iters\": 1,"
-    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_polynomial_order\": 1,"
     "      \"chebyshev_lambda_estimate_mode\": 1,"
     "      \"monitor_residual\": 0,"
     "      \"print_solve_stats\": 0"
@@ -410,7 +410,7 @@ static const char *CHEBY2_JACOBI_SA_LM2_CONFIG =
     "        \"max_iters\": 1"
     "      },"
     "      \"max_iters\": 1,"
-    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_polynomial_order\": 1,"
     "      \"chebyshev_lambda_estimate_mode\": 2,"
     "      \"monitor_residual\": 0,"
     "      \"print_solve_stats\": 0"
@@ -453,7 +453,7 @@ static const char *CHEBY2_JACOBI_SA_LM4_CONFIG =
     "        \"max_iters\": 1"
     "      },"
     "      \"max_iters\": 1,"
-    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_polynomial_order\": 1,"
     "      \"chebyshev_lambda_estimate_mode\": 4,"
     "      \"chebyshev_lmin_denom\": 10.0,"
     "      \"monitor_residual\": 0,"
@@ -495,7 +495,7 @@ static const char *CHEBY2_JACOBI_SA_LM4_SIZE4_CONFIG =
     "        \"max_iters\": 1"
     "      },"
     "      \"max_iters\": 1,"
-    "      \"chebyshev_polynomial_order\": 2,"
+    "      \"chebyshev_polynomial_order\": 1,"
     "      \"chebyshev_lambda_estimate_mode\": 4,"
     "      \"chebyshev_lmin_denom\": 10.0,"
     "      \"monitor_residual\": 0,"
@@ -606,10 +606,10 @@ int main(int argc, char **argv)
 
     // --- Active verification tests ---
     // LM4 (SA rho) with DENSE_LU coarse solver, SIZE_8 selector
-    run_solve("SA Cheby2+Jacobi, LM4, SIZE_8, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_LM4_CONFIG, 1);
+    run_solve("SA Cheby1+Jacobi, LM4, SIZE_8, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_LM4_CONFIG, 1);
 
     // LM4 (SA rho) with DENSE_LU coarse solver, SIZE_4 selector
-    run_solve("SA Cheby2+Jacobi, LM4, SIZE_4, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_LM4_SIZE4_CONFIG, 1);
+    run_solve("SA Cheby1+Jacobi, LM4, SIZE_4, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_LM4_SIZE4_CONFIG, 1);
 
     // LM4 (SA rho) with DENSE_LU coarse solver, MULTI_PAIRWISE selector
     {
@@ -626,7 +626,7 @@ int main(int argc, char **argv)
             "        \"max_iters\": 1"
             "      },"
             "      \"max_iters\": 1,"
-            "      \"chebyshev_polynomial_order\": 2,"
+            "      \"chebyshev_polynomial_order\": 1,"
             "      \"chebyshev_lambda_estimate_mode\": 4,"
             "      \"chebyshev_lmin_denom\": 10.0,"
             "      \"monitor_residual\": 0,"
@@ -652,7 +652,7 @@ int main(int argc, char **argv)
             "    \"obtain_timings\": 0"
             "  }"
             "}";
-        run_solve("SA Cheby2+Jacobi, LM4, MULTI_PAIRWISE, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_LM4_MP_CONFIG, 1);
+        run_solve("SA Cheby1+Jacobi, LM4, MULTI_PAIRWISE, DENSE_LU coarse",  matrix_file, CHEBY2_JACOBI_SA_LM4_MP_CONFIG, 1);
     }
 
     // LM4 (SA rho) with DENSE_LU coarse solver, MIS-1 selector
@@ -670,7 +670,7 @@ int main(int argc, char **argv)
             "        \"max_iters\": 1"
             "      },"
             "      \"max_iters\": 1,"
-            "      \"chebyshev_polynomial_order\": 2,"
+            "      \"chebyshev_polynomial_order\": 1,"
             "      \"chebyshev_lambda_estimate_mode\": 4,"
             "      \"chebyshev_lmin_denom\": 10.0,"
             "      \"monitor_residual\": 0,"
@@ -695,7 +695,7 @@ int main(int argc, char **argv)
             "    \"obtain_timings\": 0"
             "  }"
             "}";
-        run_solve("SA Cheby2+Jacobi, LM4, MIS-1, DENSE_LU coarse", matrix_file, CHEBY2_JACOBI_SA_LM4_MIS1_CONFIG, 1);
+        run_solve("SA Cheby1+Jacobi, LM4, MIS-1, DENSE_LU coarse", matrix_file, CHEBY2_JACOBI_SA_LM4_MIS1_CONFIG, 1);
     }
 
     // LM4 (SA rho) with DENSE_LU coarse solver, MIS-2 selector (Galerkin coarsening loop)
@@ -713,7 +713,7 @@ int main(int argc, char **argv)
             "        \"max_iters\": 1"
             "      },"
             "      \"max_iters\": 1,"
-            "      \"chebyshev_polynomial_order\": 2,"
+            "      \"chebyshev_polynomial_order\": 1,"
             "      \"chebyshev_lambda_estimate_mode\": 4,"
             "      \"chebyshev_lmin_denom\": 10.0,"
             "      \"monitor_residual\": 0,"
@@ -739,7 +739,52 @@ int main(int argc, char **argv)
             "    \"obtain_timings\": 0"
             "  }"
             "}";
-        run_solve("SA Cheby2+Jacobi, LM4, MIS-2, DENSE_LU coarse", matrix_file, CHEBY2_JACOBI_SA_LM4_MIS2_CONFIG, 1);
+        run_solve("SA Cheby1+Jacobi, LM4, MIS-2 Galerkin, DENSE_LU coarse", matrix_file, CHEBY2_JACOBI_SA_LM4_MIS2_CONFIG, 1);
+    }
+
+    // LM4 (SA rho) with DENSE_LU coarse solver, MIS-2 implicit selector
+    {
+        static const char *CHEBY2_JACOBI_SA_LM4_MIS2_IMPLICIT_CONFIG =
+            "{"
+            "  \"config_version\": 2,"
+            "  \"solver\": {"
+            "    \"algorithm\": \"AGGREGATION\","
+            "    \"solver\": \"AMG\","
+            "    \"smoother\": {"
+            "      \"solver\": \"CHEBYSHEV\","
+            "      \"preconditioner\": {"
+            "        \"solver\": \"BLOCK_JACOBI\","
+            "        \"max_iters\": 1"
+            "      },"
+            "      \"max_iters\": 1,"
+            "      \"chebyshev_polynomial_order\": 1,"
+            "      \"chebyshev_lambda_estimate_mode\": 4,"
+            "      \"chebyshev_lmin_denom\": 10.0,"
+            "      \"monitor_residual\": 0,"
+            "      \"print_solve_stats\": 0"
+            "    },"
+            "    \"presweeps\": 1,"
+            "    \"postsweeps\": 1,"
+            "    \"selector\": \"MIS\","
+            "    \"mis_k\": 2,"
+            "    \"mis2_algorithm\": 1,"
+            "    \"aggressive_levels\": 1,"
+            "    \"merge_singletons\": 1,"
+            "    \"coarse_solver\": \"DENSE_LU_SOLVER\","
+            "    \"max_iters\": 100,"
+            "    \"convergence\": \"RELATIVE_INI\","
+            "    \"tolerance\": 1e-5,"
+            "    \"norm\": \"L2\","
+            "    \"cycle\": \"V\","
+            "    \"min_coarse_rows\": 10,"
+            "    \"max_levels\": 20,"
+            "    \"print_solve_stats\": 1,"
+            "    \"print_grid_stats\": 1,"
+            "    \"monitor_residual\": 1,"
+            "    \"obtain_timings\": 0"
+            "  }"
+            "}";
+        run_solve("SA Cheby1+Jacobi, LM4, MIS-2 implicit, DENSE_LU coarse", matrix_file, CHEBY2_JACOBI_SA_LM4_MIS2_IMPLICIT_CONFIG, 1);
     }
     AMGX_finalize_plugins();
     AMGX_finalize();

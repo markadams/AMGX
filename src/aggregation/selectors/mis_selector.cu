@@ -19,9 +19,13 @@
 // MIS-k for k>1 is implemented via a Galerkin coarsening loop:
 //   R_out_agg[i] = i  (identity)
 //   for pass = 0 to k-1:
-//       Run MIS-1 on A_cur (with exchange_halo for MPI correctness — Step 1)
+//       Run MIS-1 on A_cur (with exchange_halo for MPI correctness)
 //       Compose R_out_agg via thrust::gather
 //       If not last pass: A_cur = R * A_cur * R^T  (Galerkin product)
+//         For multi-GPU: distributed RAP via initialize_manager,
+//         exchange_halo_rows_P, exchange_RAP_ext, renumberMatrixOneRing,
+//         and createOneRingHaloRows so A_cur is a proper distributed
+//         matrix for the next pass.
 //   Output: aggregates[] = R_out_agg[]
 
 #include <aggregation/selectors/mis_selector.h>
@@ -33,6 +37,8 @@
 #include <csr_multiply.h>
 #include <transpose.h>
 #include <texture.h>
+#include <distributed/distributed_manager.h>
+#include <distributed/distributed_arranger.h>
 
 #include <thrust/count.h>
 #include <thrust/gather.h>
@@ -260,9 +266,11 @@ void find_mis_k2_kernel(const IndexType *row_offsets,
                 }
 
                 // Check distance-2 neighbors (neighbors of jcol)
-                // Only expand owned nodes (jcol < num_rows) since we don't
-                // have row_offsets for halo nodes
-                if (jcol < num_rows)
+                // Expand any node with valid row_offsets (owned + halo).
+                // When the matrix has 2-ring halo rows, row_offsets are valid
+                // for 1-ring halo nodes (jcol < total_rows), allowing the
+                // kernel to reach distance-2 nodes across partition boundaries.
+                if (jcol < total_rows)
                 {
                     int kmin = row_offsets[jcol];
                     int kmax = row_offsets[jcol + 1];
@@ -655,6 +663,72 @@ void split_oversized_kernel(
 }
 
 // -----------------------------------------------------------------------
+// Kernels for distributed column compression (MIS-k Galerkin loop)
+// Mirrors sa_flag_halo_columns_kernel / sa_compress_halo_columns_kernel /
+// sa_compress_l2g_kernel from aggregation_amg_level.cu.
+// -----------------------------------------------------------------------
+
+// Flag which halo columns (col >= nrow) are referenced in the owned rows.
+template <typename IndexType>
+__global__
+void misk_flag_halo_columns_kernel(IndexType nrow, const IndexType *row_offsets,
+                                    const IndexType *col_indices, IndexType *flags)
+{
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < nrow;
+         row += gridDim.x * blockDim.x)
+    {
+        int s = row_offsets[row];
+        int e = row_offsets[row + 1];
+        for (int j = s; j < e; j++)
+        {
+            IndexType col = col_indices[j];
+            if (col >= nrow)
+            {
+                flags[col - nrow] = 1;
+            }
+        }
+    }
+}
+
+// Remap halo column indices using the prefix-summed flags array.
+template <typename IndexType>
+__global__
+void misk_compress_halo_columns_kernel(IndexType nrow, const IndexType *row_offsets,
+                                        IndexType *col_indices, const IndexType *flags)
+{
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < nrow;
+         row += gridDim.x * blockDim.x)
+    {
+        int s = row_offsets[row];
+        int e = row_offsets[row + 1];
+        for (int j = s; j < e; j++)
+        {
+            IndexType col = col_indices[j];
+            if (col >= nrow)
+            {
+                col_indices[j] = nrow + flags[col - nrow];
+            }
+        }
+    }
+}
+
+// Compress local_to_global_map: keep only entries where flags[i] != flags[i+1].
+template <typename IndexType, typename Int64Type>
+__global__
+void misk_compress_l2g_kernel(IndexType nl2g, const Int64Type *l2g_in,
+                               Int64Type *l2g_out, const IndexType *flags)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < nl2g;
+         i += gridDim.x * blockDim.x)
+    {
+        if (flags[i] != flags[i + 1])
+        {
+            l2g_out[flags[i]] = l2g_in[i];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // Constructor
 // -----------------------------------------------------------------------
 template<class T_Config>
@@ -743,13 +817,10 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
     const int threads_per_block = 256;
 
     // ------------------------------------------------------------------
-    // Multi-GPU fallback for mis_k > 1
-    // TODO (Step 4): Multi-GPU MIS-k support
-    // Use setNeighborAggregates() to set up Ac.manager from A.manager + agg_cur,
-    // then computeAOperator() for the distributed Galerkin product,
-    // then prepareNextLevelMatrix() to finalize halo rows.
-    // These functions are in aggregation_amg_level.cu and handle all
-    // distributed manager setup (B2L_maps, halo_offsets, renumbering).
+    // Determine effective MIS distance (k).
+    // Multi-GPU MIS-k is supported via the distributed Galerkin loop
+    // in Phase 6 below (initialize_manager, exchange_halo_rows_P,
+    // exchange_RAP_ext, renumberMatrixOneRing, createOneRingHaloRows).
     // ------------------------------------------------------------------
     int effective_k = this->m_mis_k;
 
@@ -765,12 +836,8 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         effective_k = 1;  // fall back to MIS-1 on non-aggressive levels
     }
 
-    if (!A.is_matrix_singleGPU() && effective_k > 1)
-    {
-        amgx_printf("WARNING: mis_k=%d not yet supported on multi-GPU, "
-                    "falling back to mis_k=1\n", effective_k);
-        effective_k = 1;
-    }
+    // Multi-GPU MIS-k is now supported via the distributed Galerkin loop below.
+    // No fallback needed.
 
     if (this->m_verbose)
     {
@@ -836,6 +903,29 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         if (this->m_verbose)
             amgx_printf("[MIS-k] Using implicit square graph MIS-2 (mis2_algorithm=1)\n");
 
+        // ------------------------------------------------------------------
+        // Multi-GPU: MIS-2 (Algorithm 1) requires 2-ring halo data so that
+        // the find_mis_k2_kernel can expand distance-2 neighbors through
+        // halo nodes near partition boundaries.  Enforce that the matrix was
+        // set up with at least 2 halo rings.
+        // ------------------------------------------------------------------
+        if (!A.is_matrix_singleGPU())
+        {
+            int nrings = A.manager->num_halo_rings();
+            if (nrings < 2)
+            {
+                FatalError("MIS-2 Algorithm 1 (implicit square graph) in multi-GPU mode "
+                           "requires num_rings >= 2, but the matrix has only 1 ring. "
+                           "Set communicator_num_rings=2 in your AMGx config.",
+                           AMGX_ERR_CONFIGURATION);
+            }
+            else if (this->m_verbose)
+            {
+                amgx_printf("[MIS-k] Matrix has %d halo ring(s) — "
+                            "2-ring halo exchange enabled for MIS-2\n", nrings);
+            }
+        }
+
         const int num_blocks_fine = std::min(AMGX_GRID_MAX_SIZE,
                                              (num_block_rows - 1) / threads_per_block + 1);
 
@@ -851,9 +941,15 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
             num_block_rows, node_weights.raw(), seed);
         cudaCheckError();
 
-        // Exchange node_weights halo for MPI
+        // Exchange node_weights halo for MPI (2-ring)
+        // Two successive 1-ring exchanges propagate data to distance-2 halo
+        // nodes: first exchange fills ring-1 halo entries, second exchange
+        // uses those ring-1 values to fill ring-2 halo entries.
         if (!A.is_matrix_singleGPU())
         {
+            node_weights.dirtybit = 1;
+            A.manager->exchange_halo(node_weights, node_weights.tag);
+            // Second exchange: propagate ring-1 halo values to ring-2
             node_weights.dirtybit = 1;
             A.manager->exchange_halo(node_weights, node_weights.tag);
         }
@@ -882,9 +978,16 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                 num_block_rows, total_rows, d_changed_ptr);
             cudaCheckError();
 
-            // Exchange status halo for MPI
+            // Exchange status halo for MPI (2-ring)
+            // Two successive 1-ring exchanges: first fills ring-1 halo
+            // entries with MIS status from neighboring partitions, second
+            // propagates those to ring-2 halo entries so the kernel can
+            // check distance-2 independence across partition boundaries.
             if (!A.is_matrix_singleGPU())
             {
+                status_vec.dirtybit = 1;
+                A.manager->exchange_halo(status_vec, status_vec.tag);
+                // Second exchange: ring-1 → ring-2
                 status_vec.dirtybit = 1;
                 A.manager->exchange_halo(status_vec, status_vec.tag);
             }
@@ -1255,9 +1358,18 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
         //
         // Build scalar A_scalar from edge_weights (block_size=1 required
         // by csr_galerkin_product), then compute A_coarse = R * A_scalar * P.
+        //
+        // For multi-GPU: follow the distributed RAP pattern from
+        // createCoarseMatrices() in aggregation_amg_level.cu:
+        //   1. initialize_manager() on P to set up coarse part_offsets
+        //   2. exchange_halo_rows_P() to get halo rows of P from neighbors
+        //   3. Local RAP = R * A_scalar * P (including halo contributions)
+        //   4. exchange_RAP_ext() to assemble off-process contributions
+        //   5. renumberMatrixOneRing() + createOneRingHaloRows() to finalize
         // ----------------------------------------------------------------
         if (pass < effective_k - 1)
         {
+            const bool is_distributed = !A_cur.is_matrix_singleGPU();
             int nnz_cur = A_cur.get_num_nz();
 
             // Build A_scalar: same sparsity as A_cur, values = edge_weights
@@ -1278,6 +1390,12 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
                 FloatToValueType<ValueType>());
             cudaCheckError();
             A_scalar.resize(n_cur, n_cur, nnz_cur, 1, 1, false);
+            // For distributed: A_scalar shares A_cur's sparsity and manager
+            if (is_distributed)
+            {
+                A_scalar.manager = A_cur.manager;
+                A_scalar.setView(OWNED);
+            }
             A_scalar.set_initialized(1);
 
             // Build P: n_cur × n_roots, one nonzero per row at agg_cur[i]
@@ -1298,22 +1416,238 @@ void MISSelector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >:
             P_cur.resize(n_cur, n_roots, n_cur, 1, 1, false);
             P_cur.set_initialized(1);
 
-            // R = P^T  (n_roots × n_cur)
-            Matrix_d R_cur;
-            R_cur.set_initialized(0);
-            R_cur.addProps(CSR);
-            R_cur.delProps(COO);
-            R_cur.delProps(DIAG);
-            R_cur.setColsReorderedByColor(false);
-            transpose(P_cur, R_cur);
+            if (!is_distributed)
+            {
+                // ============================================================
+                // Single-GPU path (unchanged)
+                // ============================================================
+                // R = P^T  (n_roots × n_cur)
+                Matrix_d R_cur;
+                R_cur.set_initialized(0);
+                R_cur.addProps(CSR);
+                R_cur.delProps(COO);
+                R_cur.delProps(DIAG);
+                R_cur.setColsReorderedByColor(false);
+                transpose(P_cur, R_cur);
 
-            // A_coarse = R * A_scalar * P  (n_roots × n_roots)
-            A_coarse.set_initialized(0);
-            CSR_Multiply<TConfig_d>::csr_galerkin_product(
-                R_cur, A_scalar, P_cur, A_coarse,
-                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-            A_coarse.computeDiagonal();
-            A_coarse.set_initialized(1);
+                // A_coarse = R * A_scalar * P  (n_roots × n_roots)
+                A_coarse.set_initialized(0);
+                CSR_Multiply<TConfig_d>::csr_galerkin_product(
+                    R_cur, A_scalar, P_cur, A_coarse,
+                    nullptr, nullptr, nullptr, nullptr,
+                    nullptr, nullptr, nullptr);
+                A_coarse.computeDiagonal();
+                A_coarse.set_initialized(1);
+            }
+            else
+            {
+                // ============================================================
+                // Multi-GPU distributed RAP path
+                //
+                // Follows the SA distributed RAP pattern from
+                // createCoarseMatrices() in aggregation_amg_level.cu.
+                // ============================================================
+                typedef TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> TConfig_h;
+                typedef typename TConfig_d::template setVecPrec<AMGX_vecInt64>::Type i64vec_value_type_d;
+                typedef typename TConfig_h::template setVecPrec<AMGX_vecInt64>::Type i64vec_value_type_h;
+                typedef typename TConfig_h::template setVecPrec<AMGX_vecInt>::Type ivec_value_type_h;
+                typedef Vector<i64vec_value_type_d> I64Vector;
+                typedef Vector<i64vec_value_type_h> I64Vector_h;
+                typedef Vector<ivec_value_type_h> IVector_h;
+
+                int num_owned_coarse_pts = n_roots;
+
+                // --- Step 1: Set up P_cur's manager via initialize_manager ---
+                // This does an allgather to compute part_offsets for the
+                // coarse level (how many coarse DOFs each rank owns).
+                DistributedArranger<TConfig_d> *prep =
+                    new DistributedArranger<TConfig_d>;
+                prep->initialize_manager(A_scalar, P_cur, num_owned_coarse_pts);
+
+                // --- Step 2: Set up A_coarse.manager ---
+                IndexType my_rank = A_cur.manager->global_id();
+
+                A_coarse.set_initialized(0);
+                if (A_coarse.manager == NULL)
+                {
+                    A_coarse.manager = new DistributedManager<TConfig_d>();
+                }
+                A_coarse.manager->A = &A_coarse;
+                A_coarse.manager->setComms(A_cur.manager->getComms());
+                A_coarse.manager->set_global_id(my_rank);
+                A_coarse.manager->set_num_partitions(
+                    A_cur.manager->get_num_partitions());
+                A_coarse.manager->part_offsets_h =
+                    P_cur.manager->part_offsets_h;
+                A_coarse.manager->part_offsets =
+                    P_cur.manager->part_offsets;
+                A_coarse.manager->set_base_index(
+                    A_coarse.manager->part_offsets_h[my_rank]);
+                A_coarse.manager->set_index_range(num_owned_coarse_pts);
+                A_coarse.manager->num_rows_global =
+                    A_coarse.manager->part_offsets_h[
+                        A_cur.manager->get_num_partitions()];
+                A_coarse.manager->local_to_global_map.resize(0);
+
+                // --- Step 3: Exchange halo rows of P ---
+                // Save P manager info for exchange_RAP_ext later
+                IVector_h P_neighbors_h = P_cur.manager->neighbors;
+                I64Vector_h P_halo_ranges_h = P_cur.manager->halo_ranges_h;
+                I64Vector P_halo_ranges = P_cur.manager->halo_ranges;
+                IVector_h P_halo_offsets_h = P_cur.manager->halo_offsets;
+
+                prep->exchange_halo_rows_P(
+                    A_scalar, P_cur,
+                    A_coarse.manager->local_to_global_map,
+                    P_neighbors_h, P_halo_ranges_h, P_halo_ranges,
+                    P_halo_offsets_h,
+                    A_coarse.manager->part_offsets_h,
+                    A_coarse.manager->part_offsets,
+                    num_owned_coarse_pts,
+                    A_coarse.manager->part_offsets_h[my_rank]);
+                cudaCheckError();
+                delete prep;
+
+                // --- Step 4: Compute R = P^T (owned rows only) ---
+                // Set P_cur to show only owned fine rows for the transpose
+                int num_owned_fine_pts = A_cur.manager->halo_offsets[0];
+                P_cur.set_initialized(0);
+                P_cur.set_num_rows(num_owned_fine_pts);
+                P_cur.addProps(CSR);
+                P_cur.set_initialized(1);
+
+                Matrix_d R_cur;
+                R_cur.set_initialized(0);
+                R_cur.addProps(CSR);
+                R_cur.delProps(COO);
+                R_cur.delProps(DIAG);
+                R_cur.setColsReorderedByColor(false);
+                transpose(P_cur, R_cur);
+
+                // --- Step 5: Compute RAP_full = R * A_scalar * P ---
+                // (local computation including halo contributions)
+                Matrix_d RAP_full;
+                RAP_full.set_initialized(0);
+                A_scalar.setView(OWNED);
+                CSR_Multiply<TConfig_d>::csr_galerkin_product(
+                    R_cur, A_scalar, P_cur, RAP_full,
+                    nullptr, nullptr, nullptr, nullptr,
+                    nullptr, nullptr, nullptr);
+                RAP_full.set_initialized(1);
+
+                // --- Step 6: Exchange RAP ext ---
+                // Update P_cur.manager with info modified by
+                // exchange_halo_rows_P
+                P_cur.manager->neighbors = P_neighbors_h;
+                P_cur.manager->halo_offsets = P_halo_offsets_h;
+                P_cur.manager->halo_ranges_h = P_halo_ranges_h;
+                P_cur.manager->halo_ranges = P_halo_ranges;
+
+                DistributedArranger<TConfig_d> *prep2 =
+                    new DistributedArranger<TConfig_d>;
+                prep2->exchange_RAP_ext(
+                    A_coarse, RAP_full, A_scalar, P_cur,
+                    P_halo_offsets_h,
+                    A_coarse.manager->local_to_global_map,
+                    P_neighbors_h, P_halo_ranges_h, P_halo_ranges,
+                    A_coarse.manager->part_offsets_h,
+                    A_coarse.manager->part_offsets,
+                    num_owned_coarse_pts,
+                    A_coarse.manager->part_offsets_h[my_rank],
+                    nullptr);
+                delete prep2;
+
+                // --- Step 7: Column compression ---
+                // Remove unused halo columns from A_coarse
+                IndexType nrow_c = A_coarse.get_num_rows();
+                IndexType ncol_c = A_coarse.get_num_cols();
+                IndexType nl2g = ncol_c - nrow_c;
+                if (nl2g > 0)
+                {
+                    IVector_d l2g_p(nl2g + 1, 0);
+                    I64Vector l2g_t(nl2g, 0);
+                    IndexType nblocks_cc = std::min(4096,
+                        (int)((nrow_c + 127) / 128));
+
+                    // Flag referenced halo columns
+                    if (nblocks_cc > 0)
+                    {
+                        misk_flag_halo_columns_kernel<IndexType>
+                            <<<nblocks_cc, 128, 0, str>>>(
+                            nrow_c, A_coarse.row_offsets.raw(),
+                            A_coarse.col_indices.raw(), l2g_p.raw());
+                        cudaCheckError();
+                    }
+
+                    // Exclusive scan to get new positions
+                    thrust_wrapper::exclusive_scan<AMGX_device>(
+                        l2g_p.begin(), l2g_p.end(), l2g_p.begin());
+                    cudaCheckError();
+
+                    // Read new count
+                    int new_nl2g_val = 0;
+                    cudaMemcpy(&new_nl2g_val,
+                               l2g_p.raw() + nl2g, sizeof(int),
+                               cudaMemcpyDeviceToHost);
+
+                    if (new_nl2g_val < nl2g)
+                    {
+                        // Compress column indices
+                        if (nblocks_cc > 0)
+                        {
+                            misk_compress_halo_columns_kernel<IndexType>
+                                <<<nblocks_cc, 128, 0, str>>>(
+                                nrow_c, A_coarse.row_offsets.raw(),
+                                A_coarse.col_indices.raw(),
+                                l2g_p.raw());
+                            cudaCheckError();
+                        }
+
+                        // Compress local_to_global_map
+                        IndexType nblocks_l2g = std::min(4096,
+                            (int)((nl2g + 127) / 128));
+                        if (nblocks_l2g > 0)
+                        {
+                            misk_compress_l2g_kernel<IndexType, int64_t>
+                                <<<nblocks_l2g, 128, 0, str>>>(
+                                nl2g,
+                                A_coarse.manager->
+                                    local_to_global_map.raw(),
+                                l2g_t.raw(), l2g_p.raw());
+                            cudaCheckError();
+                        }
+
+                        // Update matrix dimensions
+                        A_coarse.set_initialized(0);
+                        A_coarse.set_num_cols(nrow_c + new_nl2g_val);
+                        A_coarse.set_initialized(1);
+
+                        // Copy compressed l2g
+                        amgx::thrust::copy(
+                            l2g_t.begin(),
+                            l2g_t.begin() + new_nl2g_val,
+                            A_coarse.manager->
+                                local_to_global_map.begin());
+                        cudaCheckError();
+                        A_coarse.manager->
+                            local_to_global_map.resize(new_nl2g_val);
+                    }
+                }
+
+                // --- Step 8: Finalize distributed coarse matrix ---
+                A_coarse.set_initialized(0);
+                A_coarse.manager->renumberMatrixOneRing(0);
+                A_coarse.manager->createOneRingHaloRows();
+                A_coarse.manager->getComms()->set_neighbors(
+                    A_coarse.manager->num_neighbors());
+                A_coarse.setView(OWNED);
+                A_coarse.computeDiagonal();
+                A_coarse.set_initialized(1);
+
+                // Detach A_scalar's borrowed manager so it won't be
+                // double-freed when A_scalar goes out of scope
+                A_scalar.manager = NULL;
+            }
 
             // Compute edge weights for the coarse matrix: |values|
             int nnz_coarse = A_coarse.get_num_nz();

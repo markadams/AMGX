@@ -10,6 +10,7 @@ The original NVIDIA AMGx uses handshake-based pairwise matching for aggregation 
 2. **SA prolongator smoothing** — The standard `P = (I - ω D⁻¹A) P_tent` smoothing step
 3. **Chebyshev smoother eigenvalue reuse** — Avoids redundant spectral radius computation
 4. **MIS-2 (implicit)** — A new algorithm matching PETSc GAMG's aggregation quality
+5. **cuDSS coarse solver** — GPU-native sparse direct solver (LU/Cholesky) as an exact coarse-grid solver, replacing the CPU-bound `DENSE_LU_SOLVER`
 
 ## New Features
 
@@ -89,6 +90,57 @@ A new `chebyshev_lambda_estimate_mode=4` that reuses the spectral radius compute
 The `lmin_denom=11` setting matches PETSc GAMG's default Chebyshev eigenvalue interval: `emax = 1.1*rho`, `emin = 0.1*rho = emax/11`.
 
 **Smoother choice**: Chebyshev/Jacobi damps optimally when you have a decent and conservative estimate of the max eigenvalue of `D⁻¹A`. When such an estimate is unavailable or unreliable, Richardson with Jacobi-L1 (`solver=JACOBI_L1`) is more robust — it requires no eigenvalue estimate and is unconditionally stable, at the cost of slightly slower convergence.
+
+### cuDSS Coarse Solver
+
+`CUDSS_SOLVER` is a GPU-native sparse direct solver that replaces `DENSE_LU_SOLVER` as the exact coarse-grid solver in SA-AMG. It uses NVIDIA's cuDSS library (available in CUDA 12.4+) to perform sparse LU or Cholesky factorization entirely on the GPU, avoiding the CPU round-trip that `DENSE_LU_SOLVER` requires.
+
+**Key advantages over `DENSE_LU_SOLVER`:**
+- Factorizes the sparse coarse matrix directly (no dense conversion) — O(nnz) memory vs O(n²)
+- Runs entirely on the GPU — no host↔device data transfer for setup
+- Supports SPD matrices via Cholesky (LL^T), which is ~2× faster than LU
+- Reuse support: `CUDSS_PHASE_REFACTORIZATION` skips symbolic analysis on repeated setups
+- Block-CSR support: automatically expands block-CSR to scalar CSR before factorization
+
+**Configuration parameters:**
+
+| Parameter | Default | Description |
+|-----------|:-------:|-------------|
+| `cudss_matrix_type` | `"GENERAL"` | Matrix type: `"GENERAL"` (LU), `"SPD"` (Cholesky LL^T), `"SYMMETRIC"` (LDL^T) |
+| `cudss_reorder` | `1` | Reordering: `0`=none, `1`=AMD (default), `2`=alternative |
+| `exact_coarse_solve` | `0` | Multi-GPU: `1`=gather global coarse matrix and solve redundantly on each rank |
+
+**Single-GPU usage:**
+
+```json
+{
+  "coarse_solver": "CUDSS_SOLVER",
+  "cudss_matrix_type": "SPD",
+  "cudss_reorder": 1
+}
+```
+
+**Multi-GPU usage** (requires `AMGX_WITH_MPI` and `exact_coarse_solve=1`):
+
+```json
+{
+  "coarse_solver": "CUDSS_SOLVER",
+  "cudss_matrix_type": "SPD",
+  "exact_coarse_solve": 1
+}
+```
+
+When `exact_coarse_solve=1`, each rank gathers the full distributed coarse matrix (using `all_gather_v`), factorizes it redundantly with cuDSS, and extracts its local portion of the global solution. This mirrors the `DENSE_LU_SOLVER` distributed behavior.
+
+**Full config example:** `src/configs/PCG_SA_CUDSS.json`
+
+**Key files:**
+- `include/solvers/cudss_solver.h` — class declaration
+- `src/solvers/cudss_solver.cu` — implementation
+- `src/configs/PCG_SA_CUDSS.json` — ready-to-use config
+- `examples/bench_cudss_vs_dense_lu.c` — performance comparison benchmark
+
+**Requirements:** CUDA 12.4+, cuDSS library. Build with `-DAMGX_USE_CUDSS=ON`.
 
 ## Bug Fixes
 
@@ -209,6 +261,7 @@ The code runs clean under `compute-sanitizer --tool memcheck` with zero memory e
 | `examples/test_cg_sa.c` | PCG + Jacobi-L1 SA-AMG (2-level, validation) |
 | `examples/test_mg_diag.c` | Richardson + Jacobi-L1 SA-AMG (2-level, validation) |
 | `examples/gen_poisson2d.py` | Generate 2D Poisson matrices in MatrixMarket format |
+| `examples/bench_cudss_vs_dense_lu.c` | Performance comparison: `CUDSS_SOLVER` vs `DENSE_LU_SOLVER` on 2D Poisson |
 
 ## Architecture Notes
 
@@ -223,16 +276,39 @@ The code runs clean under `compute-sanitizer --tool memcheck` with zero memory e
 
 ## Building
 
+### Standard build (no cuDSS)
+
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_CUDA_ARCHITECTURES=80 -DCMAKE_BUILD_TYPE=Release
 make -j8 amgxsh
 ```
 
+### Build with cuDSS support
+
+cuDSS is included in CUDA 12.4+ (Toolkit ≥ 12.4). Enable it with:
+
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_CUDA_ARCHITECTURES=80 -DCMAKE_BUILD_TYPE=Release \
+         -DAMGX_USE_CUDSS=ON
+make -j8 amgxsh
+```
+
+On Perlmutter (NERSC), load the CUDA 12.4+ module first:
+```bash
+module load cudatoolkit/12.4
+```
+
 Build the test drivers separately (they link against the shared library):
 ```bash
+# Standard test driver
 cc -o test_multilevel_cheby ../examples/test_multilevel_cheby.c \
    -I../include -L. -lamgxsh -lcudart -Wl,-rpath,$PWD
+
+# cuDSS benchmark (requires -DAMGX_USE_CUDSS=ON build)
+cc -O2 -o bench_cudss_vs_dense_lu ../examples/bench_cudss_vs_dense_lu.c \
+   -I../include -L. -lamgxsh -lcudart -lm -Wl,-rpath,$PWD
 ```
 
 On Cray systems (e.g., NERSC Perlmutter), use the provided Makefile:
@@ -242,5 +318,5 @@ cd examples && make -f Makefile.cray test_multilevel_cheby
 
 ## Future Work
 
-- **Block-size > 1 (systems/elasticity):** The SA framework supports block problems in principle, but block-size > 1 is not yet tested. This requires a rigid body mode API (near-null space with multiple vectors per node), utility functions for block tentative prolongator construction, and validation against PETSc GAMG's systems solver.
-- **Multi-GPU (MPI):** The MIS-k selector includes halo exchange calls but has not been validated in multi-GPU configurations.
+- **Multi-GPU (MPI) validation:** The MIS-k selector includes halo exchange calls and the cuDSS coarse solver includes a multi-GPU gather/scatter path, but neither has been validated end-to-end in multi-GPU configurations. Full MPI testing on Perlmutter is the primary remaining work item.
+- **Block-size > 1 (systems/elasticity) validation:** Block-CSR → scalar CSR expansion is implemented in the cuDSS solver, but block-size > 1 has not been validated against PETSc GAMG's systems solver. A rigid body mode API (near-null space with multiple vectors per node) and block tentative prolongator construction are needed for full SA-AMG systems support.

@@ -65,6 +65,19 @@ ENDIF(NOT CMAKE_BUILD_TYPE)
 
 find_package(CUDAToolkit 12.0 REQUIRED)
 
+if(AMGX_USE_CUDSS)
+    find_package(cudss REQUIRED
+        HINTS ${CUDSS_ROOT} $ENV{CUDSS_ROOT}
+              /usr/local/cudss /opt/nvidia/cudss)
+    if(cudss_FOUND)
+        message(STATUS "cuDSS found: ${cudss_INCLUDE_DIRS}")
+        add_compile_definitions(AMGX_USE_CUDSS)
+    else()
+        message(WARNING "cuDSS not found; CUDSS_SOLVER disabled")
+        set(AMGX_USE_CUDSS OFF)
+    endif()
+endif()
+
 # CUDA 13.1+ requires C++17 for Thrust and CUDA C++ Core Libraries
 if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1")
   message(STATUS "CUDA ${CUDAToolkit_VERSION} detected, setting C++17 standard")
@@ -126,6 +139,7 @@ endif()
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 # ignore rpath completely, if requested:
+option(AMGX_USE_CUDSS "Enable cuDSS coarse-grid solver" OFF)
 set(AMGX_NO_RPATH False CACHE BOOL "Don't build RPATH")
 if (${AMGX_NO_RPATH})
   set(CMAKE_SKIP_RPATH TRUE)
@@ -263,6 +277,12 @@ ELSE (WIN32)
   target_link_libraries(amgx CUDA::cublas CUDA::cusparse CUDA::cusolver m pthread)
   target_link_libraries(amgxsh CUDA::cublas CUDA::cusparse CUDA::cusolver m pthread)
 ENDIF(WIN32)
+
+if(AMGX_USE_CUDSS)
+    target_link_libraries(amgx CUDA::cudss)
+    target_link_libraries(amgxsh CUDA::cudss)
+    target_include_directories(amgx_libs PRIVATE ${cudss_INCLUDE_DIRS})
+endif()
 
 if(MPI_FOUND)
     target_link_libraries(amgx   MPI::MPI_CXX)

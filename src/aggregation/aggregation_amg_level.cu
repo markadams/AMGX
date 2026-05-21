@@ -87,6 +87,68 @@ void set_to_one_kernel(IndexType start, IndexType end, IndexType *ind, ValueType
     }
 }
 
+// --- Kernels for SA distributed column compression (mirrors classical path) ---
+
+// Flag which halo columns (col >= nrow) are referenced in the owned rows of Ac.
+template <typename IndexType>
+__global__
+void sa_flag_halo_columns_kernel(IndexType nrow, const IndexType *row_offsets,
+                                  const IndexType *col_indices, IndexType *flags)
+{
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < nrow;
+         row += gridDim.x * blockDim.x)
+    {
+        int s = row_offsets[row];
+        int e = row_offsets[row + 1];
+        for (int j = s; j < e; j++)
+        {
+            IndexType col = col_indices[j];
+            if (col >= nrow)
+            {
+                flags[col - nrow] = 1;
+            }
+        }
+    }
+}
+
+// Remap halo column indices using the prefix-summed flags array.
+template <typename IndexType>
+__global__
+void sa_compress_halo_columns_kernel(IndexType nrow, const IndexType *row_offsets,
+                                      IndexType *col_indices, const IndexType *flags)
+{
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < nrow;
+         row += gridDim.x * blockDim.x)
+    {
+        int s = row_offsets[row];
+        int e = row_offsets[row + 1];
+        for (int j = s; j < e; j++)
+        {
+            IndexType col = col_indices[j];
+            if (col >= nrow)
+            {
+                col_indices[j] = nrow + flags[col - nrow];
+            }
+        }
+    }
+}
+
+// Compress local_to_global_map: keep only entries where flags[i] != flags[i+1].
+template <typename IndexType, typename Int64Type>
+__global__
+void sa_compress_l2g_kernel(IndexType nl2g, const Int64Type *l2g_in,
+                             Int64Type *l2g_out, const IndexType *flags)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < nl2g;
+         i += gridDim.x * blockDim.x)
+    {
+        if (flags[i] != flags[i + 1])
+        {
+            l2g_out[flags[i]] = l2g_in[i];
+        }
+    }
+}
+
 template <typename IndexType>
 __global__
 void renumberAggregatesKernel(const IndexType *renumbering, const int interior_offset, const int bdy_offset, IndexType *aggregates, const int num_aggregates, const int n_interior, const int renumbering_size)
@@ -877,6 +939,17 @@ void Aggregation_AMG_Level_Base<T_Config >::prolongateAndApplyCorrection(VVector
     // x += P * e  (alpha = 1, no error scaling for SA)
     if (m_null_dim > 0 && m_P_tent.get_num_rows() > 0)
     {
+        // Halo exchange on the coarse error vector e before the SA prolongation SpMV.
+        // Columns of m_P_tent reference coarse DOFs owned by other MPI ranks; their
+        // values must be present in e's halo before multiply() is called.
+        if (!Ac.is_matrix_singleGPU() && !this->isConsolidationLevel() && e.delayed_send == 0)
+        {
+            e.dirtybit = 1;
+            if (e.in_transfer & RECEIVING) { Ac.manager->exchange_halo_wait(e, e.tag); }
+            Ac.manager->exchange_halo_async(e, e.tag);
+            Ac.manager->exchange_halo_wait(e, e.tag);
+        }
+
         VVector prolongated(this->A->get_num_rows());
         fill(prolongated, types::util<ValueTypeB>::get_zero());
         multiply(m_P_tent, e, prolongated, OWNED);
@@ -919,6 +992,17 @@ void Aggregation_AMG_Level_Base<T_Config>::restrictResidual(VVector &r, VVector 
     // rr = P^T * r  (CSR SpMV with the stored transpose)
     if (m_null_dim > 0 && m_P_tent_T.get_num_rows() > 0)
     {
+        // Halo exchange on fine residual r before SA restriction SpMV.
+        // Columns of m_P_tent_T reference fine DOFs owned by other MPI ranks;
+        // their values must be present in r's halo before multiply() is called.
+        if (!this->A->is_matrix_singleGPU() && !this->isConsolidationLevel() && r.delayed_send == 0)
+        {
+            r.dirtybit = 1;
+            if (r.in_transfer & RECEIVING) { this->A->manager->exchange_halo_wait(r, r.tag); }
+            this->A->manager->exchange_halo_async(r, r.tag);
+            this->A->manager->exchange_halo_wait(r, r.tag);
+        }
+
         multiply(m_P_tent_T, r, rr, OWNED);
     }
     else if (this->A->get_block_size() == 1)
@@ -2053,6 +2137,10 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
         setNearNullSpace(nd, nr, nns.data());
     }
 
+    // Flag for distributed SA path — declared outside SA block so it's visible
+    // in the RAP and prepareNextLevelMatrix sections below.
+    bool sa_distributed = false;
+
     // SA is only supported for real-valued types (float/double), not complex.
     // Use sizeof check: for real types, sizeof(ValueTypeB) == sizeof(PODType);
     // for complex types, sizeof(ValueTypeB) == 2 * sizeof(PODType).
@@ -2087,6 +2175,137 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
             }
         }
         buildTentativeProlongator();
+
+        // --- Distributed SA: exchange halo rows of P_tent before smoothing ---
+        // In the distributed case (multi-GPU), P_tent was built for owned fine rows only.
+        // We need halo rows of P_tent (from neighbors) so that:
+        //   (a) smoothProlongator can compute S*P_tent correctly (S connects owned to halo)
+        //   (b) the Galerkin product P^T*A*P includes off-process contributions
+        // This follows the classical AMG distributed RAP pattern.
+        sa_distributed = !A.is_matrix_singleGPU();
+        int num_owned_fine_pts = 0;
+        int num_owned_coarse_pts = m_num_aggregates * m_null_dim;  // coarse DOF count
+
+        // Variables for distributed RAP (declared here, used later)
+        IVector_h P_neighbors_h;
+        I64Vector_h P_halo_ranges_h;
+        I64Vector P_halo_ranges;
+        IVector_h P_halo_offsets_h;
+
+        if (sa_distributed)
+        {
+            int block_size = A.get_block_dimy();
+            // num_owned_fine_pts is DOF-level (P_tent rows = nodes * block_size)
+            num_owned_fine_pts = A.manager->halo_offsets[0] * block_size;
+
+            // 1. Set up m_P_tent.manager using initialize_manager
+            //    This does an allgather to compute part_offsets for the coarse level.
+            DistributedArranger<TConfig> *prep = new DistributedArranger<TConfig>;
+            prep->initialize_manager(A, m_P_tent, num_owned_coarse_pts);
+
+            // 2. Initialize Ac.manager from P_tent's manager info
+            //    (override what setNeighborAggregates partially set up)
+            IndexType num_parts = A.manager->get_num_partitions();
+            IndexType my_rank = A.manager->global_id();
+
+            if (Ac.manager == NULL)
+            {
+                Ac.manager = new DistributedManager<TConfig>();
+            }
+            Ac.manager->A = &Ac;
+            Ac.manager->setComms(A.manager->getComms());
+            Ac.manager->set_global_id(my_rank);
+            Ac.manager->set_num_partitions(num_parts);
+            Ac.manager->part_offsets_h = m_P_tent.manager->part_offsets_h;
+            Ac.manager->part_offsets = m_P_tent.manager->part_offsets;
+            Ac.manager->set_base_index(Ac.manager->part_offsets_h[my_rank]);
+            Ac.manager->set_index_range(num_owned_coarse_pts);
+            Ac.manager->num_rows_global = Ac.manager->part_offsets_h[num_parts];
+
+            // 3. P_tent has no halo columns initially (all columns are owned coarse DOFs).
+            //    local_to_global_map starts empty.
+            Ac.manager->local_to_global_map.resize(0);
+
+            // 4. Copy P manager info for exchange_halo_rows_P
+            P_neighbors_h = m_P_tent.manager->neighbors;  // empty initially
+            P_halo_ranges_h = m_P_tent.manager->halo_ranges_h;
+            P_halo_ranges = m_P_tent.manager->halo_ranges;
+            P_halo_offsets_h = m_P_tent.manager->halo_offsets;
+
+            // 5. Exchange halo rows of P_tent from neighbors.
+            //    This sends owned boundary rows of P_tent to neighbors and receives
+            //    halo rows from neighbors, appending them to m_P_tent.
+            //
+            //    pack_halo_rows_P uses A.manager->B2L_maps[i] as row indices into P
+            //    and A.manager->B2L_rings[i][ring] as the count of boundary rows.
+            //    These are node-level indices. When block_size > 1, P_tent is a
+            //    DOF-level scalar matrix (rows = nodes * block_size), so we must
+            //    temporarily expand B2L maps to DOF-level indices.
+            //
+            //    For block_size == 1, node indices == DOF indices, so no change needed.
+
+            // Save original B2L maps/rings and expand for block_size > 1
+            int num_neighbors = A.manager->num_neighbors();
+            std::vector<IVector> orig_B2L_maps;
+            std::vector<std::vector<VecInt_t>> orig_B2L_rings;
+
+            if (block_size > 1)
+            {
+                orig_B2L_maps.resize(num_neighbors);
+                orig_B2L_rings.resize(num_neighbors);
+                for (int i = 0; i < num_neighbors; i++)
+                {
+                    // Save originals
+                    orig_B2L_maps[i] = A.manager->B2L_maps[i];
+                    orig_B2L_rings[i].assign(A.manager->B2L_rings[i].begin(),
+                                              A.manager->B2L_rings[i].end());
+
+                    // Expand node-level B2L map to DOF-level:
+                    // Each node n maps to DOFs [n*bs, n*bs+1, ..., n*bs+(bs-1)]
+                    int node_count = (int)A.manager->B2L_maps[i].size();
+                    IVector_h node_B2L_h(A.manager->B2L_maps[i]);
+                    IVector_h dof_B2L_h(node_count * block_size);
+                    for (int j = 0; j < node_count; j++)
+                    {
+                        int node = node_B2L_h[j];
+                        for (int k = 0; k < block_size; k++)
+                        {
+                            dof_B2L_h[j * block_size + k] = node * block_size + k;
+                        }
+                    }
+                    A.manager->B2L_maps[i] = dof_B2L_h;
+
+                    // Scale B2L_rings counts by block_size
+                    for (size_t r = 0; r < A.manager->B2L_rings[i].size(); r++)
+                    {
+                        A.manager->B2L_rings[i][r] *= block_size;
+                    }
+                }
+            }
+
+            prep->exchange_halo_rows_P(A, m_P_tent,
+                                       Ac.manager->local_to_global_map,
+                                       P_neighbors_h, P_halo_ranges_h, P_halo_ranges,
+                                       P_halo_offsets_h,
+                                       Ac.manager->part_offsets_h, Ac.manager->part_offsets,
+                                       num_owned_coarse_pts,
+                                       Ac.manager->part_offsets_h[my_rank]);
+            cudaCheckError();
+
+            // Restore original B2L maps/rings after exchange
+            if (block_size > 1)
+            {
+                for (int i = 0; i < num_neighbors; i++)
+                {
+                    A.manager->B2L_maps[i] = orig_B2L_maps[i];
+                    A.manager->B2L_rings[i].assign(orig_B2L_rings[i].begin(),
+                                                    orig_B2L_rings[i].end());
+                }
+            }
+
+            delete prep;
+        }
+
         smoothProlongator();
 
         // Pass the SA-computed rho(D^{-1}A) to the Chebyshev smoother so that
@@ -2104,35 +2323,21 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
             }
         }
 
+        // For the distributed case, set P_tent to show only owned fine rows
+        // for the transpose (R = P^T uses owned rows only, like classical path).
+        if (sa_distributed)
+        {
+            m_P_tent.set_initialized(0);
+            m_P_tent.set_num_rows(num_owned_fine_pts);
+            m_P_tent.addProps(CSR);
+            m_P_tent.set_initialized(1);
+        }
+
         // Compute and store P^T for use in restrictResidual()
         transpose(m_P_tent, m_P_tent_T);
 
-        // Propagate coarse near-null space to the next level
-        AMG_Level<TConfig> *next = this->getNextLevel(MemorySpace());
-        Aggregation_AMG_Level_Base<TConfig> *next_agg =
-            dynamic_cast<Aggregation_AMG_Level_Base<TConfig>*>(next);
-        if (next_agg != nullptr && m_coarse_near_null_space.size() > 0)
-        {
-            int coarse_dofs = m_num_aggregates * m_null_dim;
-            int total = coarse_dofs * m_null_dim;
-
-            // Copy device near-null space to host and convert to double.
-            // For real types (float/double), ValueTypeB == PODType, so static_cast works.
-            std::vector<ValueTypeB> h_vtmp(total);
-            cudaMemcpy(h_vtmp.data(), m_coarse_near_null_space.raw(),
-                       total * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
-            cudaCheckError();
-
-            std::vector<double> h_coarse_nns_double(total);
-            for (int i = 0; i < total; ++i)
-            {
-                // This static_cast is safe because we've verified ValueTypeB is a real type above
-                h_coarse_nns_double[i] = static_cast<double>(
-                    *reinterpret_cast<typename types::PODTypes<ValueTypeB>::type*>(&h_vtmp[i]));
-            }
-
-            next_agg->setNearNullSpace(m_null_dim, coarse_dofs, h_coarse_nns_double.data());
-        }
+        // Near-null space propagation is deferred to after Ac is fully set up
+        // (including halo structure for distributed case). See below.
     }
     // --- End SA path ---
 
@@ -2143,9 +2348,132 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
     // which is incorrect for SA.  CSR_Multiply::csr_galerkin_product handles real-valued P.
     if (m_null_dim > 0 && m_P_tent.get_num_rows() > 0)
     {
-        CSR_Multiply<TConfig>::csr_galerkin_product(
-            m_P_tent_T, A, m_P_tent, Ac,
-            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        if (!sa_distributed)
+        {
+            // Single-GPU path: local-only triple product (unchanged)
+            CSR_Multiply<TConfig>::csr_galerkin_product(
+                m_P_tent_T, A, m_P_tent, Ac,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        }
+        else
+        {
+            // ---------------------------------------------------------------
+            // Distributed SA path: follow the classical AMG RAP pattern.
+            // P_tent has halo rows appended (from exchange_halo_rows_P above),
+            // but num_rows is set to owned only. The CSR arrays still contain
+            // halo data, so the galerkin product can access halo rows of P
+            // via column indices of A that reference halo fine nodes.
+            // ---------------------------------------------------------------
+
+            // Initialize CSR workspace
+            void *wk = AMG_Level<TConfig>::amg->getCsrWorkspace();
+            if (wk == NULL)
+            {
+                wk = CSR_Multiply<TConfig>::csr_workspace_create(
+                    *(AMG_Level<TConfig>::amg->m_cfg),
+                    AMG_Level<TConfig>::amg->m_cfg_scope);
+                AMG_Level<TConfig>::amg->setCsrWorkspace(wk);
+            }
+
+            // Compute RAP_full = R * A * P (local computation including halo contributions)
+            // RAP_full will have num_owned_coarse_pts rows for owned coarse nodes,
+            // plus extra rows for halo coarse nodes (from halo rows of P_tent_T).
+            Matrix<TConfig> RAP_full;
+            RAP_full.set_initialized(0);
+            A.setView(OWNED);
+            CSR_Multiply<TConfig>::csr_galerkin_product(
+                m_P_tent_T, A, m_P_tent, RAP_full,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, wk);
+            RAP_full.set_initialized(1);
+
+            // Update m_P_tent.manager with info modified by exchange_halo_rows_P.
+            // exchange_RAP_ext -> pack_halo_rows_RAP uses P.manager->neighbors,
+            // P.manager->halo_offsets, P.manager->base_index(), etc.
+            m_P_tent.manager->neighbors = P_neighbors_h;
+            m_P_tent.manager->halo_offsets = P_halo_offsets_h;
+            m_P_tent.manager->halo_ranges_h = P_halo_ranges_h;
+            m_P_tent.manager->halo_ranges = P_halo_ranges;
+
+            // Exchange RAP rows: send extra rows (halo coarse) to neighbors,
+            // receive contributions from neighbors, and assemble final Ac.
+            DistributedArranger<TConfig> *prep2 = new DistributedArranger<TConfig>;
+            prep2->exchange_RAP_ext(Ac, RAP_full, A, m_P_tent,
+                                    P_halo_offsets_h,
+                                    Ac.manager->local_to_global_map,
+                                    P_neighbors_h, P_halo_ranges_h, P_halo_ranges,
+                                    Ac.manager->part_offsets_h, Ac.manager->part_offsets,
+                                    num_owned_coarse_pts,
+                                    Ac.manager->part_offsets_h[A.manager->global_id()],
+                                    wk);
+            delete prep2;
+
+            // Column compression: remove unused halo columns from Ac.
+            // Some halo columns in local_to_global_map may not appear in
+            // the owned rows of Ac after assembly. This mirrors the classical
+            // path's column compression (classical_amg_level.cu).
+            IndexType nrow = Ac.get_num_rows();
+            IndexType ncol = Ac.get_num_cols();
+            IndexType nl2g = ncol - nrow;
+
+            if (nl2g > 0)
+            {
+                IVector l2g_p(nl2g + 1, 0);  // +1 for exclusive_scan
+                I64Vector l2g_t(nl2g, 0);
+                IndexType nblocks = std::min(4096, (int)((nrow + 127) / 128));
+
+                // Step 1: Flag which halo columns are referenced
+                if (nblocks > 0)
+                {
+                    sa_flag_halo_columns_kernel<IndexType><<<nblocks, 128>>>(
+                        nrow, Ac.row_offsets.raw(), Ac.col_indices.raw(), l2g_p.raw());
+                }
+                cudaCheckError();
+
+                // Step 2: Exclusive scan to get new positions
+                thrust_wrapper::exclusive_scan<TConfig::memSpace>(
+                    l2g_p.begin(), l2g_p.end(), l2g_p.begin());
+                int new_nl2g = l2g_p[nl2g];
+
+                // Step 3: Compress column indices
+                if (nblocks > 0)
+                {
+                    sa_compress_halo_columns_kernel<IndexType><<<nblocks, 128>>>(
+                        nrow, Ac.row_offsets.raw(), Ac.col_indices.raw(), l2g_p.raw());
+                }
+                cudaCheckError();
+
+                // Step 4: Adjust matrix size
+                Ac.set_initialized(0);
+                Ac.set_num_cols(nrow + new_nl2g);
+                Ac.set_initialized(1);
+
+                // Step 5: Compress local_to_global_map
+                nblocks = std::min(4096, (int)((nl2g + 127) / 128));
+                if (nblocks > 0)
+                {
+                    sa_compress_l2g_kernel<IndexType, int64_t><<<nblocks, 128>>>(
+                        nl2g, Ac.manager->local_to_global_map.raw(),
+                        l2g_t.raw(), l2g_p.raw());
+                }
+                cudaCheckError();
+                amgx::thrust::copy(l2g_t.begin(), l2g_t.begin() + new_nl2g,
+                                   Ac.manager->local_to_global_map.begin());
+                cudaCheckError();
+                Ac.manager->local_to_global_map.resize(new_nl2g);
+            }
+
+            // Finalize the distributed coarse matrix:
+            // renumberMatrixOneRing creates B2L maps and sets up halo structure
+            Ac.set_initialized(0);
+            Ac.manager->renumberMatrixOneRing(this->isReuseLevel() ? 1 : 0);
+            Ac.manager->createOneRingHaloRows();
+            Ac.manager->getComms()->set_neighbors(Ac.manager->num_neighbors());
+            Ac.setView(OWNED);
+            Ac.set_initialized(1);
+
+            // Restore A to ALL view for consistency
+            A.setView(ALL);
+        }
     }
     else
     {
@@ -2161,13 +2489,139 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
     }
     else
     {
-        this->prepareNextLevelMatrix(A, Ac);
+        // For the distributed SA path, the coarse matrix is already finalized
+        // (renumberMatrixOneRing + createOneRingHaloRows were called above).
+        // Only call prepareNextLevelMatrix for non-SA or single-GPU paths.
+        if (!(m_null_dim > 0 && m_P_tent.get_num_rows() > 0 && sa_distributed))
+        {
+            this->prepareNextLevelMatrix(A, Ac);
+        }
     }
 
     A.setView(OWNED);
     Ac.setView(OWNED);
 
-    this->m_next_level_size = this->m_num_all_aggregates * Ac.get_block_dimy();
+    if (sa_distributed && m_null_dim > 0)
+    {
+        // For distributed SA, m_next_level_size uses the FULL view of Ac
+        int size, offset;
+        Ac.getOffsetAndSizeForView(FULL, &offset, &size);
+        this->m_next_level_size = size * Ac.get_block_dimy();
+    }
+    else
+    {
+        this->m_next_level_size = this->m_num_all_aggregates * Ac.get_block_dimy();
+    }
+
+    // ---------------------------------------------------------------
+    // Propagate coarse near-null space to the next level.
+    // This is done after Ac is fully set up so that in the distributed
+    // case we can exchange halo aggregate near-null space values.
+    // ---------------------------------------------------------------
+    if (m_null_dim > 0 && m_coarse_near_null_space.size() > 0)
+    {
+        AMG_Level<TConfig> *next = this->getNextLevel(MemorySpace());
+        Aggregation_AMG_Level_Base<TConfig> *next_agg =
+            dynamic_cast<Aggregation_AMG_Level_Base<TConfig>*>(next);
+        if (next_agg != nullptr)
+        {
+            int num_owned_aggs = m_num_aggregates;
+            int coarse_dofs_owned = num_owned_aggs * m_null_dim;
+
+            if (sa_distributed && Ac.manager != nullptr &&
+                Ac.manager->num_neighbors() > 0)
+            {
+                // ---------------------------------------------------
+                // Distributed case (all null_dim values):
+                // Exchange halo near-null space values so the next
+                // level's buildTentativeProlongator() can look up
+                // near-null space for halo aggregates.
+                //
+                // The coarse near-null space from QR has layout:
+                //   [vec_0(agg_0..agg_{N-1}), vec_1(agg_0..agg_{N-1}), ...]
+                // where N = num_owned_aggs.  We need to expand each
+                // vector to include halo aggregate values, producing:
+                //   [vec_0(agg_0..agg_{T-1}), vec_1(agg_0..agg_{T-1}), ...]
+                // where T = total_coarse_nodes (owned + halo).
+                //
+                // We exchange each near-null vector separately using
+                // exchange_halo(), which handles one scalar per node.
+                // ---------------------------------------------------
+
+                // Total coarse nodes including halos
+                int num_halo_offsets = Ac.manager->num_halo_offsets();
+                int total_coarse_nodes = (num_halo_offsets > 0)
+                    ? Ac.manager->halo_offset(num_halo_offsets - 1)
+                    : num_owned_aggs;
+
+                // Output: null_dim blocks of total_coarse_nodes each
+                int total_nns_size = m_null_dim * total_coarse_nodes;
+                std::vector<double> h_coarse_nns_double(total_nns_size);
+
+                // Temporary device vector for a single near-null vector
+                VVector nns_with_halo(total_coarse_nodes);
+
+                for (int v = 0; v < m_null_dim; ++v)
+                {
+                    // Copy owned values for vector v into the owned portion.
+                    // Source: m_coarse_near_null_space at offset v * num_owned_aggs
+                    cudaMemcpy(nns_with_halo.raw(),
+                               m_coarse_near_null_space.raw() + v * num_owned_aggs,
+                               num_owned_aggs * sizeof(ValueTypeB),
+                               cudaMemcpyDeviceToDevice);
+                    cudaCheckError();
+
+                    // Mark dirty so exchange_halo sends data
+                    nns_with_halo.dirtybit = 1;
+                    nns_with_halo.set_block_dimx(1);
+                    nns_with_halo.set_block_dimy(1);
+
+                    // Exchange halo values for this near-null vector.
+                    // Use distinct tags per vector to avoid message confusion.
+                    Ac.manager->exchange_halo(nns_with_halo, 7799 + v);
+
+                    // Copy full vector (owned + halo) to host and convert
+                    // to double for setNearNullSpace.
+                    std::vector<ValueTypeB> h_vtmp(total_coarse_nodes);
+                    cudaMemcpy(h_vtmp.data(), nns_with_halo.raw(),
+                               total_coarse_nodes * sizeof(ValueTypeB),
+                               cudaMemcpyDeviceToHost);
+                    cudaCheckError();
+
+                    int dst_offset = v * total_coarse_nodes;
+                    for (int i = 0; i < total_coarse_nodes; ++i)
+                    {
+                        h_coarse_nns_double[dst_offset + i] = static_cast<double>(
+                            *reinterpret_cast<typename types::PODTypes<ValueTypeB>::type*>(&h_vtmp[i]));
+                    }
+                }
+
+                next_agg->setNearNullSpace(m_null_dim, total_coarse_nodes, h_coarse_nns_double.data());
+            }
+            else
+            {
+                // ---------------------------------------------------
+                // Single-GPU case (no halo neighbors):
+                // Propagate owned near-null space only.
+                // ---------------------------------------------------
+                int total = coarse_dofs_owned * m_null_dim;
+
+                std::vector<ValueTypeB> h_vtmp(total);
+                cudaMemcpy(h_vtmp.data(), m_coarse_near_null_space.raw(),
+                           total * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+                cudaCheckError();
+
+                std::vector<double> h_coarse_nns_double(total);
+                for (int i = 0; i < total; ++i)
+                {
+                    h_coarse_nns_double[i] = static_cast<double>(
+                        *reinterpret_cast<typename types::PODTypes<ValueTypeB>::type*>(&h_vtmp[i]));
+                }
+
+                next_agg->setNearNullSpace(m_null_dim, coarse_dofs_owned, h_coarse_nns_double.data());
+            }
+        }
+    }
 
     if (this->m_print_aggregation_info)
     {
@@ -2955,7 +3409,12 @@ void Aggregation_AMG_Level_Base<T_Config>::buildTentativeProlongator()
 
     Matrix<TConfig> &A = this->getA();
     int block_size = A.get_block_dimy();
-    int num_nodes  = A.get_num_rows();       // block-rows (nodes)
+    // In the distributed case, only build P_tent for owned fine rows.
+    // The near-null space is only available for owned DOFs, and halo rows
+    // of P_tent will be obtained via exchange_halo_rows_P.
+    int num_nodes  = (!A.is_matrix_singleGPU() && A.manager != NULL)
+                     ? A.manager->halo_offsets[0]
+                     : A.get_num_rows();       // block-rows (nodes)
     int num_fine_rows = num_nodes * block_size;  // total DOF rows
     int num_coarse_cols = m_num_aggregates * m_null_dim;
     int nnz = num_fine_rows * m_null_dim;

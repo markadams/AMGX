@@ -54,6 +54,9 @@
 #include <solvers/fixcolor_gauss_seidel_solver.h>
 #include <solvers/dummy_solver.h>
 #include <solvers/dense_lu_solver.h>
+#ifdef AMGX_USE_CUDSS
+#include <solvers/cudss_solver.h>
+#endif
 #include <solvers/kaczmarz_solver.h>
 #include <solvers/chebyshev_poly.h>
 
@@ -396,6 +399,11 @@ inline void registerParameters()
     //DENSE_LU_SOLVER
     AMG_Config::registerParameter<int>("dense_lu_num_rows", "the dense LU solver will be triggered if the matrix size <= dense_lu_num_rows", 128);
     AMG_Config::registerParameter<int>("dense_lu_max_rows", "the dense LU solver will not be triggered if the matrix size >= dense_lu_max_rows > 0 (not used by default)", 0);
+    // cuDSS solver parameters
+    AMG_Config::registerParameter<int>("cudss_reorder",
+        "cuDSS reordering algorithm: 0=none, 1=AMD, 2=METIS <1>", 1);
+    AMG_Config::registerParameter<std::string>("cudss_matrix_type",
+        "cuDSS matrix type: SPD or GENERAL <GENERAL>", std::string("GENERAL"));
     //Richardson's iteration - relaxation parameter
     AMG_Config::registerParameter<double>("relaxation_factor", "the relaxation factor used in a solver", 0.9, 0.0, 2.0);
     //Richardson's iteration - ILU
@@ -635,6 +643,9 @@ struct registerClasses<T_Config, false>
         SolverFactory<T_Config>::registerFactory("KACZMARZ", new KaczmarzSolverFactory<T_Config>); //not exposed
         //Dense LU (performed locally on each partition in distributed setting)
         SolverFactory<T_Config>::registerFactory("DENSE_LU_SOLVER", new dense_lu_solver::DenseLUSolverFactory<T_Config>);
+#ifdef AMGX_USE_CUDSS
+        SolverFactory<T_Config>::registerFactory("CUDSS_SOLVER", new cudss_solver::CudssSolverFactory<T_Config>);
+#endif
         //No Solver
         SolverFactory<T_Config>::registerFactory("NOSOLVER", new Dummy_SolverFactory<T_Config>);
         //Register AMGLevel Types
