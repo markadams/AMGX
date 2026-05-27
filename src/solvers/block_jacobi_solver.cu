@@ -1366,7 +1366,6 @@ void BlockJacobiSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPr
     cudaCheckError();
     Cusparse::bsrmv(types::util<ValueTypeB>::get_minus_one(), A, x, types::util<ValueTypeB>::get_one(), this->y, separation_flags);         // y= -1.0f*(A.x) + y
     cudaCheckError();
-
     Cusparse::bsrmv(types::util<ValueTypeB>::get_one() * this->weight, A, this->Dinv, this->y, types::util<ValueTypeB>::get_one(), x, separation_flags); // t_res = t_res + w*(Dinv.y) @ view
     cudaCheckError();
 }

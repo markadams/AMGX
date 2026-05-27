@@ -17,6 +17,7 @@
 #include <algorithm>
 
 #include <amg_level.h>
+#include <aggregation/aggregation_amg_level.h>
 #include <amgx_c.h>
 #include <distributed/glue.h>
 
@@ -60,6 +61,8 @@ AMG<t_vecPrec, t_matPrec, t_indPrec>
 
     std::string solverName, new_scope, tmp_scope;
     cfg.getParameter<std::string>( "coarse_solver", solverName, cfg_scope, new_scope );
+    fprintf(stderr, "[SA-DBG] AMG::AMG: cfg_scope='%s'  coarse_solver='%s'  new_scope='%s'\n",
+            cfg_scope.c_str(), solverName.c_str(), new_scope.c_str());
 
     if (solverName.compare("NOSOLVER") == 0)
     {
@@ -204,6 +207,8 @@ class AMG_Setup
 
                 //Check if you reached the coarsest level (min_partition_rows  is the number of rows in this partition/rank)
                 //NOTE: min_rows = min_coarse_rows if async framework is disabled (min_fine_rows =< min_coarse_rows)
+                fprintf(stderr, "[SA-DBG] setup loop check: num_levels=%d max_levels=%d min_partition_rows=%d min_rows=%d\n",
+                        amg->num_levels, amg->max_levels, min_partition_rows, min_rows);
                 if (amg->num_levels >= amg->max_levels || min_partition_rows <= min_rows)
                 {
                     //Check if the user wishes to use DENSE_LU_SOLVER capping the matrix the size, and the matrix size exceeds the maximum allowed
@@ -274,6 +279,8 @@ class AMG_Setup
                 nextLevel->getA().amg_level_index = amg->num_levels;
                 int64_t N = num_rows_global * level->getA().get_block_dimy();
                 num_rows[0] = num_rows_global = level->getNumCoarseVertices();
+                fprintf(stderr, "[SA-DBG] amg.cu setup_v1: N=%lld, getNumCoarseVertices=%lld, block_dimy=%d\n",
+                        (long long)N, (long long)num_rows_global, (int)level->getA().get_block_dimy());
 
                 if (level->getA().is_matrix_distributed())
                 {
@@ -289,6 +296,10 @@ class AMG_Setup
 
                 // num_rows[0] contains the total number of rows across all partitions
                 int64_t nextN = num_rows_global * level->getA().get_block_dimy();
+                fprintf(stderr, "[SA-DBG] amg.cu setup_v1: nextN=%lld, coarsen_threshold=%f, nextN<=thresh*N=%d, nextN!=N=%d\n",
+                        (long long)nextN, (double)amg->coarsen_threshold,
+                        (int)(nextN <= amg->coarsen_threshold * N),
+                        (int)(nextN != N));
 
                 if (!level->getA().is_matrix_distributed())
                 {
@@ -361,18 +372,27 @@ class AMG_Setup
                     }
                 }
 
-                // stop here if next level size is < min_rows
-                if ( nextN <= amg->coarsen_threshold * N && nextN != N && min_partition_rows >= min_rows )
+                // Create coarse level if coarsening ratio is acceptable.
+                // min_coarse_rows is a target: coarsening continues until a grid
+                // falls below the target, but that grid is kept (not thrown away).
+                // The min_partition_rows < min_rows check at the top of the loop
+                // (line ~207) stops further coarsening on the next iteration.
+                if ( nextN <= amg->coarsen_threshold * N && nextN != N )
                 {
                     level->createCoarseMatrices();
                     // Resize coarse vectors.
+                    // After createCoarseMatrices(), nextLevel->getA() has the correct
+                    // block_dimy (e.g. null_dim=6 after createBlockGraph for SA).
+                    // Use nextLevel's block_dimy, not the current level's, so that
+                    // bc/xc match the coarse smoother's matrix block structure.
                     int nextSize = level->getNextLevelSize();
+                    int next_bdimy = nextLevel->getA().get_block_dimy();
                     level->getxc( ).resize( nextSize );
-                    level->getxc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getxc().set_block_dimy(next_bdimy);
                     level->getxc().set_block_dimx(1);
                     level->getxc().tag = nextLevel->tag * 100 + 1;
                     level->getbc( ).resize( nextSize );
-                    level->getbc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getbc().set_block_dimy(next_bdimy);
                     level->getbc().set_block_dimx(1);
                     level->getbc().tag = nextLevel->tag * 100 + 0;
                     int size, offset;
@@ -728,8 +748,9 @@ class AMG_Setup
                     }
                 }
 
-                // stop here if next level size is < min_rows
-                if ( nextN <= amg->coarsen_threshold * N && nextN != N && min_partition_rows >= min_rows )
+                // Create coarse level if coarsening ratio is acceptable.
+                // min_coarse_rows is a target: the grid that falls below it is kept.
+                if ( nextN <= amg->coarsen_threshold * N && nextN != N )
                 {
                     level->createCoarseMatrices();
                     // Resize coarse vectors.
@@ -972,7 +993,18 @@ class AMG_Setup
 
                 if ( coarseSolver )
                 {
-                    coarseSolver->setup( level_0->getA(), false );
+                    // Walk the hierarchy to find the actual coarsest level.
+                    // setup() returns prev_level (the parent of the coarsest),
+                    // not the coarsest level itself.  We need the coarsest
+                    // level's matrix for the coarse solver.
+                    AMG_Level<TConfig0> *coarsestLevel = level_0;
+                    while (coarsestLevel->getNextLevel(memorySpaceTag0) != NULL)
+                        coarsestLevel = coarsestLevel->getNextLevel(memorySpaceTag0);
+                    fprintf(stderr, "[SA-DBG] coarse solver setup: coarsestLevel A: num_rows=%d  block_dimy=%d  nnz=%d\n",
+                            (int)coarsestLevel->getA().get_num_rows(),
+                            (int)coarsestLevel->getA().get_block_dimy(),
+                            (int)coarsestLevel->getA().get_num_nz());
+                    coarseSolver->setup( coarsestLevel->getA(), false );
                 }
             }
             else
@@ -1124,7 +1156,9 @@ void AMG<t_vecPrec, t_matPrec, t_indPrec>::setup( Matrix_h &A )
 {
     if ( m_dense_lu_num_rows > 0 )
     {
-        min_coarse_rows = m_dense_lu_num_rows / A.get_block_dimy();
+        // Use the larger of the user-specified min_coarse_rows and the DENSE_LU cap.
+        // This ensures --min-coarse N is respected even when DENSE_LU_SOLVER is active.
+        min_coarse_rows = std::max( min_coarse_rows, m_dense_lu_num_rows / A.get_block_dimy() );
     }
 
     // read reuse structure levels option from config in case it has been changed
@@ -1153,7 +1187,9 @@ void AMG<t_vecPrec, t_matPrec, t_indPrec>::setup( Matrix_d &A )
 {
     if ( m_dense_lu_num_rows > 0 )
     {
-        min_coarse_rows = m_dense_lu_num_rows / A.get_block_dimy();
+        // Use the larger of the user-specified min_coarse_rows and the DENSE_LU cap.
+        // This ensures --min-coarse N is respected even when DENSE_LU_SOLVER is active.
+        min_coarse_rows = std::max( min_coarse_rows, m_dense_lu_num_rows / A.get_block_dimy() );
     }
 
     // read reuse structure levels option from config in case it has been changed
@@ -1346,6 +1382,38 @@ void AMG<t_vecPrec, t_matPrec, t_indPrec>::getGridStatisticsString(std::stringst
     ss << "         Operator Complexity: " << total_nnz / (double) fine_nnz << std::endl;
     ss << "         Total Memory Usage: " << total_size << " GB" << std::endl;
     ss << "         ----------------------------------------------------------------------\n";
+
+    // SA eigen estimate summary: walk device levels, print rho/omega for SA levels.
+    {
+        bool any_sa = false;
+        AMG_Level<TConfig_d> *lvl = this->fine_d;
+        while (lvl != NULL)
+        {
+            typedef amgx::aggregation::Aggregation_AMG_Level_Base<TConfig_d> AggLevel_d;
+            AggLevel_d *agg = dynamic_cast<AggLevel_d *>(lvl);
+            if (agg != nullptr && agg->getSARho() > 0.0)
+            {
+                if (!any_sa)
+                {
+                    ss << "         SA Eigen Estimates (rho = spectral radius of D^{-1}A):\n";
+                    ss << std::setw(15) << "LVL"
+                       << std::setw(18) << "rho(D^{-1}A)"
+                       << std::setw(18) << "omega=(4/3)/rho" << "\n";
+                    ss << "         ----------------------------------------------------------------------\n";
+                    any_sa = true;
+                }
+                double rho   = agg->getSARho();
+                double omega = (rho > 0.0) ? (4.0 / 3.0) / rho : 0.0;
+                ss << std::setw(15) << lvl->getLevelIndex()
+                   << std::setw(18) << std::scientific << std::setprecision(6) << rho
+                   << std::setw(18) << omega
+                   << std::defaultfloat << std::setprecision(6) << "\n";
+            }
+            lvl = lvl->getNextLevel(device_memory());
+        }
+        if (any_sa)
+            ss << "         ----------------------------------------------------------------------\n";
+    }
 }
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>

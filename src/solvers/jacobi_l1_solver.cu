@@ -33,9 +33,10 @@ __global__ void jacobi_l1_postsmooth(
     for (int i = gid; i < n; i += blockDim.x * gridDim.x)
     {
         ValueTypeA d = d_in[i];
+        if (!isNotCloseToZero(d)) continue;  // skip zero-diagonal DOFs
         ValueTypeB b = b_in[i];
         ValueTypeB y = y_in[i];
-        d = ValueTypeA( 1 ) / (isNotCloseToZero(d) ? d : epsilon(d));
+        d = ValueTypeA( 1 ) / d;
         b -= y;
         b *= omega;
         x[i] = b * d + x[i];
@@ -51,8 +52,9 @@ __global__ void jacobi_l1_postsmooth_zero(
     for (int i = gid; i < n; i += blockDim.x * gridDim.x)
     {
         ValueTypeA d = d_in[i];
+        if (!isNotCloseToZero(d)) { x[i] = ValueTypeB(0); continue; }  // skip zero-diagonal DOFs
         ValueTypeB b = b_in[i];
-        x[i] = omega * b / (isNotCloseToZero(d) ? d : epsilon(d));
+        x[i] = omega * b / d;
     }
 }
 
@@ -87,6 +89,54 @@ __global__ void compute_d_kernel(const IndexType num_rows,
 
         // set sign of L1-norm appropriately
         d[ridx] = (is_npd) ? -d_ : d_;
+    }
+}
+
+// BxB kernel: computes per-scalar-DOF L1 norm from BSR format.
+// For scalar DOF (block_row * bsize + local_row), sums |A[block_row,block_col][local_row, local_col]|
+// over all block columns and all local columns.
+template<typename IndexType, typename ValueTypeA, typename ValueTypeB>
+__global__ void compute_d_BxB_kernel(const IndexType num_block_rows,
+                                     const int bsize,
+                                     const IndexType *A_row_offsets,
+                                     const IndexType *A_col_indices,
+                                     const ValueTypeA *A_nonzero_values,
+                                     ValueTypeA *d)
+{
+    // Each thread handles one scalar DOF
+    IndexType tidx = blockDim.x * blockIdx.x + threadIdx.x;
+    IndexType total_scalar_rows = num_block_rows * bsize;
+
+    for (IndexType scalar_row = tidx; scalar_row < total_scalar_rows; scalar_row += blockDim.x * gridDim.x)
+    {
+        IndexType block_row = scalar_row / bsize;
+        int local_row = (int)(scalar_row % bsize);
+
+        ValueTypeB d_ = 0;
+        bool is_npd = false;
+
+        IndexType row_start = A_row_offsets[block_row];
+        IndexType row_end   = A_row_offsets[block_row + 1];
+
+        for (IndexType jb = row_start; jb < row_end; jb++)
+        {
+            IndexType block_col = A_col_indices[jb];
+            // Values stored row-major within each block: block [jb] has bsize*bsize entries
+            // Entry [local_row, local_col] is at offset jb*bsize*bsize + local_row*bsize + local_col
+            const ValueTypeA *block_vals = A_nonzero_values + jb * bsize * bsize + local_row * bsize;
+
+            for (int local_col = 0; local_col < bsize; local_col++)
+            {
+                ValueTypeA val = block_vals[local_col];
+                if (block_col == block_row && local_col == local_row && val < ValueTypeA(0))
+                {
+                    is_npd = true;
+                }
+                d_ += fabs(val);
+            }
+        }
+
+        d[scalar_row] = is_npd ? -d_ : d_;
     }
 }
 
@@ -164,7 +214,8 @@ __global__ void jacobi_smooth_kernel(const IndexType num_rows,
             Axi += Ax[j] * x[Aj[j]];
         }
 
-        xout[ridx] = x[ridx] + (b[ridx] - Axi) / ( isNotCloseToZero( d[ridx]) ? d[ridx] : epsilon(d[ridx]) );
+        if (!isNotCloseToZero(d[ridx])) { xout[ridx] = x[ridx]; continue; }  // skip zero-diagonal DOFs
+        xout[ridx] = x[ridx] + (b[ridx] - Axi) / d[ridx];
     }
 }
 
@@ -262,7 +313,8 @@ __global__ void jacobi_smooth_with_0_initial_guess_kernel(const IndexType num_ro
 
     for (int ridx = row_offset + tidx; ridx < num_rows; ridx += blockDim.x * gridDim.x)
     {
-        x[ridx] = weight * b[ridx] /  ( isNotCloseToZero( d[ridx]) ? d[ridx] : epsilon(d[ridx]) );
+        if (!isNotCloseToZero(d[ridx])) { x[ridx] = ValueTypeB(0); continue; }  // skip zero-diagonal DOFs
+        x[ridx] = weight * b[ridx] / d[ridx];
     }
 }
 
@@ -321,6 +373,10 @@ void JacobiL1Solver_Base<T_Config>::compute_d( Matrix<T_Config> &A)
     {
         compute_d_4x4(A);
     }
+    else if (A.get_block_dimx() == A.get_block_dimy())
+    {
+        compute_d_BxB(A);
+    }
     else
     {
         FatalError("Unsupported block size for JacobiL1Solver", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
@@ -357,6 +413,24 @@ template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrec
 void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::compute_d_4x4(const Matrix_h &A)
 {
     FatalError("4x4 block matrices not supported on host", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::compute_d_BxB(const Matrix_h &A)
+{
+    FatalError("BxB block matrices not supported on host", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_BxB(Matrix_h &A, VVector &b, VVector &x, ViewType separation_flags)
+{
+    FatalError("BxB block matrices not supported on host", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_with_0_initial_guess_BxB(Matrix_h &A, VVector &b, VVector &x, ViewType separation_flags)
+{
+    FatalError("BxB block matrices not supported on host", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
 }
 
 
@@ -407,7 +481,67 @@ void JacobiL1Solver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec>
     cudaCheckError();
 }
 
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void JacobiL1Solver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::compute_d_BxB(const Matrix_d &A)
+{
+    typedef typename Matrix_d::index_type IndexType;
+    typedef typename Matrix_d::value_type ValueTypeA;
+    const int bsize = A.get_block_dimx();
+    const IndexType num_block_rows = A.get_num_rows();
+    const size_t THREADS_PER_BLOCK = 128;
+    const size_t total_scalar_rows = (size_t)num_block_rows * bsize;
+    const size_t NUM_BLOCKS = std::min((size_t)AMGX_GRID_MAX_SIZE,
+                                       (total_scalar_rows + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+    if (total_scalar_rows > 0)
+    {
+        compute_d_BxB_kernel<IndexType, ValueTypeA, ValueTypeB> <<< (unsigned int)NUM_BLOCKS, (unsigned int)THREADS_PER_BLOCK >>>
+        (num_block_rows, bsize,
+         A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(),
+         this->m_d.raw());
+    }
+    cudaCheckError();
+}
 
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void JacobiL1Solver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::smooth_BxB(Matrix_d &A, VVector &b, VVector &x, ViewType separation_flags)
+{
+    this->y_tmp.set_block_dimx(b.get_block_dimx());
+    this->y_tmp.set_block_dimy(b.get_block_dimy());
+    multiply(A, x, this->y_tmp, A.getViewExterior());
+    // getOffsetAndSizeForView returns block-row counts; convert to scalar DOFs
+    int block_offset, num_block_rows;
+    A.getOffsetAndSizeForView(A.getViewExterior(), &block_offset, &num_block_rows);
+    const int bsize = A.get_block_dimx();
+    int scalar_offset = block_offset * bsize;
+    int n = (num_block_rows - block_offset) * bsize;
+    int nthreads_per_block = 128;
+    int nblocks = n / nthreads_per_block + 1;
+    jacobi_l1_postsmooth<<<nblocks, nthreads_per_block>>>(n, this->weight,
+        x.raw() + scalar_offset, this->m_d.raw() + scalar_offset,
+        b.raw() + scalar_offset, this->y_tmp.raw() + scalar_offset);
+    cudaCheckError();
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void JacobiL1Solver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::smooth_with_0_initial_guess_BxB(Matrix_d &A, VVector &b, VVector &x, ViewType separation_flags)
+{
+    ViewType oldView = A.currentView();
+    A.setViewExterior();
+    // getOffsetAndSizeForView returns block-row counts; convert to scalar DOFs
+    int block_offset, num_block_rows;
+    A.getOffsetAndSizeForView(A.getViewExterior(), &block_offset, &num_block_rows);
+    const int bsize = A.get_block_dimx();
+    int scalar_offset = block_offset * bsize;
+    int n = (num_block_rows - block_offset) * bsize;
+    int nthreads_per_block = 128;
+    int nblocks = n / nthreads_per_block + 1;
+    jacobi_l1_postsmooth_zero<<<nblocks, nthreads_per_block>>>(n, this->weight,
+        x.raw() + scalar_offset, this->m_d.raw() + scalar_offset,
+        b.raw() + scalar_offset);
+    cudaCheckError();
+    A.setView(oldView);
+    cudaCheckError();
+}
 
 
 
@@ -438,6 +572,17 @@ JacobiL1Solver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIs
         else
         {
             smooth_1x1(*this->m_explicit_A, b, x, this->m_explicit_A->getViewExterior(), false);
+        }
+    }
+    else if (this->m_explicit_A->get_block_dimx() == this->m_explicit_A->get_block_dimy())
+    {
+        if (xIsZero)
+        {
+            smooth_with_0_initial_guess_BxB(*this->m_explicit_A, b, x, this->m_explicit_A->getViewExterior());
+        }
+        else
+        {
+            smooth_BxB(*this->m_explicit_A, b, x, this->m_explicit_A->getViewExterior());
         }
     }
     else
@@ -475,7 +620,8 @@ void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >
         }
 
         ValueTypeA d = this->m_d[i];
-        newx[i] = x[i] + (b[i] - Axi) /  ( isNotCloseToZero( d) ? d : epsilon(d) );
+        if (!isNotCloseToZero(d)) { newx[i] = x[i]; continue; }  // skip zero-diagonal DOFs
+        newx[i] = x[i] + (b[i] - Axi) / d;
     }
 
     x.swap(newx);
@@ -495,7 +641,8 @@ void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >
     for (int i = 0; i < A.get_num_rows(); i++)
     {
         ValueTypeA d = this->m_d[i];
-        x[i] = b[i] / ( isNotCloseToZero( d) ? d : epsilon(d) );
+        if (!isNotCloseToZero(d)) { x[i] = ValueTypeB(0); continue; }  // skip zero-diagonal DOFs
+        x[i] = b[i] / d;
     }
 }
 

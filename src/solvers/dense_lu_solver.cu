@@ -63,48 +63,48 @@ void csr_to_dense_kernel(
     T   *__restrict A_dense,
     const int lda)
 {
-    // Note:
-    // To handle block CSR, the sparsity pattern csr_rows and csr_cols only store
-    // the typical csr info assuming each block is a scalar.
-    // The values in csr_vals has all entries in the blocks, using row major to
-    // store the block. So we need the number of entries in each block as stride.
+    // To handle block CSR, csr_rows/csr_cols store block-level sparsity.
+    // csr_vals stores block_mxn entries per block in row-major order.
+    // Each warp processes one block-row.  Each lane iterates over block
+    // entries with stride WARP_SIZE so that block_mxn > WARP_SIZE is
+    // handled correctly (e.g. 6x6 = 36 entries per block).
     const int block_mxn = block_num_rows * block_num_cols;
-    // Each lane copies one entry in a block and iterate through row sparsity pattern.
-    // Essentially one warp per row-block. For 4x4, we have 16 working threads per warp.
     const int lane_id = threadIdx.x % WARP_SIZE;
-    // find the (row,col) local to a block
-    const int block_row = lane_id / block_num_cols;
-    const int block_col = lane_id % block_num_cols;
 
-    // These are wasted threads per warp
-    if ( block_row >= block_num_rows ) { return; }
-
-    // The first row to consider. One row per warp.
+    // One block-row per warp.
     int row = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
     const int row_offset = blockDim.x * gridDim.x / WARP_SIZE;
 
     for ( ; row < num_rows ; row += row_offset )
     {
-        int dense_row = row * block_num_rows + block_row;
-        // Iterate over each row and copy the elements into col-major A_dense
         int row_end = A_csr_rows[row + 1];
 
         for (int row_it = A_csr_rows[row]; row_it < row_end ; ++row_it )
         {
             int col = A_csr_cols[row_it];
+            if ( col >= num_rows ) { continue; }
 
-            if ( col >= num_rows ) { continue; } // Skip entries corresponding to halo
-
-            int dense_col = col * block_num_cols + block_col;
-            A_dense[dense_col * lda + dense_row] = A_csr_vals[block_mxn * row_it + lane_id];
+            for (int e = lane_id; e < block_mxn; e += WARP_SIZE)
+            {
+                int br = e / block_num_cols;
+                int bc = e % block_num_cols;
+                int dense_row = row * block_num_rows + br;
+                int dense_col = col * block_num_cols + bc;
+                A_dense[dense_col * lda + dense_row] = A_csr_vals[block_mxn * row_it + e];
+            }
         }
 
-        // copy diagonal block
         if ( A_csr_diag )
         {
             int diag_it = A_csr_diag[row];
-            int dense_col = row * block_num_cols + block_col; // diag means row=col
-            A_dense[dense_col * lda + dense_row] = A_csr_vals[block_mxn * diag_it + lane_id];
+            for (int e = lane_id; e < block_mxn; e += WARP_SIZE)
+            {
+                int br = e / block_num_cols;
+                int bc = e % block_num_cols;
+                int dense_row = row * block_num_rows + br;
+                int dense_col = row * block_num_cols + bc;
+                A_dense[dense_col * lda + dense_row] = A_csr_vals[block_mxn * diag_it + e];
+            }
         }
     }
 }
@@ -891,6 +891,40 @@ solver_setup(bool reuse_matrix_structure)
     }
 
     cudense_getrf(); // do LU factor
+
+    // Diagnostic: print the diagonal of the LU-factored dense matrix.
+    // For a SPD matrix, all diagonal entries of U (= diagonal of LU) must be > 0.
+    // A negative or near-zero pivot means Ac is not SPD — the coarse solve will
+    // produce a non-symmetric correction, breaking PCG.
+    {
+        int n = m_num_rows;
+        if (n > 0 && n <= 2048)  // only for small coarsest matrices
+        {
+            std::vector<Matrix_data> dense_h(static_cast<size_t>(n) * n);
+            cudaMemcpy(dense_h.data(), m_dense_A,
+                       static_cast<size_t>(n) * n * sizeof(Matrix_data),
+                       cudaMemcpyDeviceToHost);
+            double min_pivot = 1e300, max_pivot = -1e300;
+            int n_neg = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                // After getrf, the diagonal of the stored matrix is U's diagonal.
+                double piv = (double)dense_h[i * n + i];  // col-major: [col*lda+row]
+                // col-major: element (i,i) is at index i*lda + i = i*n + i
+                if (piv < min_pivot) min_pivot = piv;
+                if (piv > max_pivot) max_pivot = piv;
+                if (piv < 0.0) ++n_neg;
+            }
+            fprintf(stderr,
+                "[DENSE-LU-DIAG] n=%d  min_U_diag=%.6e  max_U_diag=%.6e  "
+                "n_negative_pivots=%d  %s\n",
+                n, min_pivot, max_pivot, n_neg,
+                (n_neg > 0) ? "*** NON-SPD: negative pivot(s) ***"
+                            : (min_pivot < 1e-10 ? "*** WARNING: near-zero pivot ***"
+                                                 : "OK"));
+        }
+    }
+
     A->setView(oldView);
 }
 

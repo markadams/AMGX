@@ -20,7 +20,7 @@ template<class T_Config>
 void Selector<T_Config>::renumberAndCountAggregates(IVector &aggregates, IVector &aggregates_global, const IndexType num_block_rows, IndexType &num_aggregates)
 {
     // renumber aggregates
-    IVector scratch(num_block_rows + 1);
+    IVector scratch(num_block_rows + 1, 0);
 
     if ( num_block_rows != aggregates.size() )
     {
@@ -29,16 +29,20 @@ void Selector<T_Config>::renumberAndCountAggregates(IVector &aggregates, IVector
         amgx::thrust::copy(aggregates.begin(), aggregates.begin() + num_block_rows, aggregates_global.begin());
     }
 
-    // set scratch[aggregates[i]] = 1
-    thrust::fill(amgx::thrust::make_permutation_iterator(scratch.begin(), aggregates.begin()),
-                 amgx::thrust::make_permutation_iterator(scratch.begin(), aggregates.begin() + num_block_rows), 1);
-    // do prefix sum on scratch
+    // Mark which aggregate IDs are used.
+    amgx::thrust::fill(amgx::thrust::make_permutation_iterator(scratch.begin(), aggregates.begin()),
+                       amgx::thrust::make_permutation_iterator(scratch.begin(), aggregates.begin() + num_block_rows),
+                       1);
+    cudaCheckError();
+
+    // Exclusive prefix sum: scratch[a] becomes the new ID for aggregate a.
     thrust_wrapper::exclusive_scan<T_Config::memSpace>(scratch.begin(), scratch.end(), scratch.begin());
-    // aggregates[i] = scratch[aggregates[i]]
-    amgx::thrust::copy(amgx::thrust::make_permutation_iterator(scratch.begin(), aggregates.begin()),
-                 amgx::thrust::make_permutation_iterator(scratch.begin(), aggregates.begin() + num_block_rows),
-                 aggregates.begin());
-    // update number of aggregates
+
+    // Renumber: aggregates[i] = scratch[aggregates[i]].
+    amgx::thrust::gather(aggregates.begin(), aggregates.begin() + num_block_rows, scratch.begin(), aggregates.begin());
+    cudaCheckError();
+
+    // update number of aggregates (last element of exclusive scan = total count)
     num_aggregates = scratch[scratch.size() - 1];
     cudaCheckError();
 }

@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <aggregation/aggregation_amg_level.h>
+#include <aggregation/batched_qr.h>
 #include <matrix_analysis.h>
+#include <solvers/cheb_solver.h>
 
 #ifdef _WIN32
 #pragma warning (push)
@@ -19,11 +21,14 @@
 #include <cutil.h>
 #include <multiply.h>
 #include <transpose.h>
+#include <csr_multiply.h>
 #include <blas.h>
 #include <string>
 #include <string.h>
 #include <iostream>
 #include <algorithm>
+#include <cmath>
+#include <set>
 #include <amgx_timer.h>
 
 #include <amgx_types/util.h>
@@ -43,10 +48,47 @@ namespace amgx
 namespace aggregation
 {
 
+// ---------------------------------------------------------------------------
+// Static global: path to aggregate override file (empty = disabled).
+// Set via Aggregation_AMG_Level_Base<T>::setAggregateOverrideFile() before
+// solver.setup() to inject aggregates from a PETSc GAMG export file.
+// ---------------------------------------------------------------------------
+static std::string s_agg_override_file;
+
+void setAggregateOverrideFile(const char *path)
+{
+    s_agg_override_file = (path ? path : "");
+}
 
 // ----------------------
 // Kernels
 // ----------------------
+
+// Reshape R factors from per-aggregate column-major layout to global column-major B_c layout.
+// R_out layout: R_out[a * nd*nd + col*nd + row] (column-major nd×nd per aggregate)
+// B_coarse layout: B_coarse[k * num_aggs*nd + a*nd + j] (global column-major)
+// where k = null vector index, a = aggregate, j = local DOF within aggregate
+template <typename ValueType>
+__global__
+void reshape_R_to_coarse_B_kernel(
+    int num_aggs,
+    int null_dim,
+    const ValueType * __restrict__ R_out,     // [num_aggs * nd * nd], per-agg column-major
+    ValueType * __restrict__ B_coarse)         // [num_aggs * nd * nd], global column-major
+{
+    int total = num_aggs * null_dim * null_dim;
+    for (int idx = blockDim.x * blockIdx.x + threadIdx.x; idx < total; idx += gridDim.x * blockDim.x)
+    {
+        // Decode: which coarse DOF and which null vector?
+        int k = idx / (num_aggs * null_dim);   // null vector index
+        int c = idx % (num_aggs * null_dim);   // coarse DOF index
+        int a = c / null_dim;                   // aggregate
+        int j = c % null_dim;                   // local DOF within aggregate
+
+        // R_out index: a * nd*nd + k*nd + j (column-major within aggregate)
+        B_coarse[idx] = R_out[a * null_dim * null_dim + k * null_dim + j];
+    }
+}
 
 template <typename IndexType, typename ValueType>
 __global__
@@ -55,6 +97,82 @@ void set_to_one_kernel(IndexType start, IndexType end, IndexType *ind, ValueType
     for (int tid = start + blockDim.x * blockIdx.x + threadIdx.x; tid < end; tid += gridDim.x * blockDim.x)
     {
         v[ind[tid]] = types::util<ValueType>::get_one();
+    }
+}
+
+// --- Kernels for SA distributed column compression (mirrors classical path) ---
+
+// Flag which halo columns (col >= nrow) are referenced in the owned rows of Ac.
+template <typename IndexType>
+__global__
+void sa_flag_halo_columns_kernel(IndexType nrow, const IndexType *row_offsets,
+                                  const IndexType *col_indices, IndexType *flags)
+{
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < nrow;
+         row += gridDim.x * blockDim.x)
+    {
+        int s = row_offsets[row];
+        int e = row_offsets[row + 1];
+        for (int j = s; j < e; j++)
+        {
+            IndexType col = col_indices[j];
+            if (col >= nrow)
+            {
+                flags[col - nrow] = 1;
+            }
+        }
+    }
+}
+
+// Remap halo column indices using the prefix-summed flags array.
+template <typename IndexType>
+__global__
+void sa_compress_halo_columns_kernel(IndexType nrow, const IndexType *row_offsets,
+                                      IndexType *col_indices, const IndexType *flags)
+{
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < nrow;
+         row += gridDim.x * blockDim.x)
+    {
+        int s = row_offsets[row];
+        int e = row_offsets[row + 1];
+        for (int j = s; j < e; j++)
+        {
+            IndexType col = col_indices[j];
+            if (col >= nrow)
+            {
+                col_indices[j] = nrow + flags[col - nrow];
+            }
+        }
+    }
+}
+
+// Compress local_to_global_map: keep only entries where flags[i] != flags[i+1].
+template <typename IndexType, typename Int64Type>
+__global__
+void sa_compress_l2g_kernel(IndexType nl2g, const Int64Type *l2g_in,
+                             Int64Type *l2g_out, const IndexType *flags)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < nl2g;
+         i += gridDim.x * blockDim.x)
+    {
+        if (flags[i] != flags[i + 1])
+        {
+            l2g_out[flags[i]] = l2g_in[i];
+        }
+    }
+}
+
+// Count how many nodes belong to each aggregate (for singleton detection).
+__global__
+void count_aggregate_sizes_kernel(const int *aggregates, int *agg_sizes,
+                                   const int num_rows)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    while (tid < num_rows)
+    {
+        if (aggregates[tid] >= 0)
+            atomicAdd(&agg_sizes[aggregates[tid]], 1);
+        tid += gridDim.x * blockDim.x;
     }
 }
 
@@ -844,8 +962,143 @@ void Aggregation_AMG_Level_Base<T_Config >::prolongateAndApplyCorrection(VVector
 {
     Matrix<TConfig> &Ac = this->getNextLevel( MemorySpace( ) )->getA();
 
+    // SA path: use the smoothed prolongator P for grid transfer.
+    // x += P * e  (alpha = 1, no error scaling for SA)
+    if (m_null_dim > 0 && m_P_tent.get_num_rows() > 0)
+    {
+        // Diagnostic: norm of coarse error e before prolongation
+        {
+            int n_e = e.size();
+            double norm_e = 0.0;
+            std::vector<ValueTypeB> e_h(n_e);
+            cudaMemcpy(e_h.data(), e.raw(), n_e * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < n_e; i++) { double a = (double)types::util<ValueTypeB>::abs(e_h[i]); norm_e += a * a; }
+            norm_e = sqrt(norm_e);
+            fprintf(stderr, "[VCYCLE-DBG] prolongateAndCorrect: ||e_coarse||=%e  e.size=%d  e.num_rows=%d  e.block_dimy=%d\n",
+                    norm_e, n_e, e.get_num_rows(), (int)e.get_block_dimy());
+        }
+        // Diagnostic: verify coarse solve: compute ||Ac*e - rr|| / ||rr||
+        // This checks whether the dense LU produced a correct solution.
+        // bf holds the coarse RHS (rr) passed into this function.
+        // Only run on first call (static guard) to avoid flooding output.
+        {
+            static bool coarse_check_done = false;
+            int n_e = e.size();
+            int n_b = bf.size();
+            if (!coarse_check_done && n_e > 0 && n_b > 0 && n_e == n_b && Ac.get_num_rows() == n_e)
+            {
+                coarse_check_done = true;
+                typedef typename types::PODTypes<ValueTypeA>::type PodA;
+                typedef typename types::PODTypes<ValueTypeB>::type PodB;
+                int Ac_nrows = Ac.get_num_rows();
+                int Ac_nnz   = Ac.get_num_nz();
+                std::vector<int>      Ac_row_h(Ac_nrows + 1);
+                std::vector<int>      Ac_col_h(Ac_nnz);
+                std::vector<PodA>     Ac_val_h(Ac_nnz);
+                std::vector<PodB>     e_h(n_e), b_h(n_b);
+                // Copy Ac values as POD scalars (works for real; for complex takes real part)
+                {
+                    std::vector<ValueTypeA> tmp_a(Ac_nnz);
+                    cudaMemcpy(tmp_a.data(), Ac.values.raw(), Ac_nnz*sizeof(ValueTypeA), cudaMemcpyDeviceToHost);
+                    for (int i = 0; i < Ac_nnz; ++i) Ac_val_h[i] = static_cast<PodA>(types::util<ValueTypeA>::abs(tmp_a[i]));
+                    // Note: abs() loses sign. For real symmetric positive definite Ac, diagonal is positive.
+                    // We need signed values. Use memcpy trick: POD type is first member of complex.
+                    memcpy(Ac_val_h.data(), tmp_a.data(), Ac_nnz * sizeof(PodA));
+                }
+                {
+                    std::vector<ValueTypeB> tmp_b(n_e);
+                    cudaMemcpy(tmp_b.data(), e.raw(), n_e*sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+                    memcpy(e_h.data(), tmp_b.data(), n_e * sizeof(PodB));
+                    cudaMemcpy(tmp_b.data(), bf.raw(), n_b*sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+                    memcpy(b_h.data(), tmp_b.data(), n_b * sizeof(PodB));
+                }
+                cudaMemcpy(Ac_row_h.data(), Ac.row_offsets.raw(), (Ac_nrows+1)*sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(Ac_col_h.data(), Ac.col_indices.raw(), Ac_nnz*sizeof(int), cudaMemcpyDeviceToHost);
+                // Compute Ac*e (CPU SpMV)
+                std::vector<double> Ace(Ac_nrows, 0.0);
+                for (int row = 0; row < Ac_nrows; ++row)
+                    for (int j = Ac_row_h[row]; j < Ac_row_h[row+1]; ++j)
+                        if (Ac_col_h[j] < n_e)
+                            Ace[row] += (double)Ac_val_h[j] * (double)e_h[Ac_col_h[j]];
+                double norm_res = 0.0, norm_rr = 0.0;
+                for (int i = 0; i < Ac_nrows; ++i)
+                {
+                    double res = Ace[i] - (double)b_h[i];
+                    norm_res += res * res;
+                    norm_rr  += (double)b_h[i] * (double)b_h[i];
+                }
+                norm_res = sqrt(norm_res);
+                norm_rr  = sqrt(norm_rr);
+                fprintf(stderr, "[VCYCLE-DBG] coarse solve check: ||Ac*e - rr||=%.4e  ||rr||=%.4e  rel=%.4e\n",
+                        norm_res, norm_rr, (norm_rr > 0.0 ? norm_res/norm_rr : -1.0));
+            }
+        }
+        // Diagnostic: norm of x before correction
+        {
+            int n_x = x.size();
+            double norm_x = 0.0;
+            std::vector<ValueTypeB> x_h(n_x);
+            cudaMemcpy(x_h.data(), x.raw(), n_x * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < n_x; i++) { double a = (double)types::util<ValueTypeB>::abs(x_h[i]); norm_x += a * a; }
+            norm_x = sqrt(norm_x);
+            fprintf(stderr, "[VCYCLE-DBG] prolongateAndCorrect: ||x_before||=%e  x.size=%d  x.num_rows=%d  x.block_dimy=%d\n",
+                    norm_x, n_x, x.get_num_rows(), (int)x.get_block_dimy());
+        }
+
+        // Halo exchange on the coarse error vector e before the SA prolongation SpMV.
+        // Columns of m_P_tent reference coarse DOFs owned by other MPI ranks; their
+        // values must be present in e's halo before multiply() is called.
+        if (!Ac.is_matrix_singleGPU() && !this->isConsolidationLevel() && e.delayed_send == 0)
+        {
+            e.dirtybit = 1;
+            if (e.in_transfer & RECEIVING) { Ac.manager->exchange_halo_wait(e, e.tag); }
+            Ac.manager->exchange_halo_async(e, e.tag);
+            Ac.manager->exchange_halo_wait(e, e.tag);
+        }
+
+        // m_P_tent is scalar (1x1 blocks): rows=num_fine_dofs, cols=num_coarse_dofs.
+        // When A has block_size > 1, x is a block vector (block_dimy=bs, num_rows=num_nodes)
+        // but its raw storage holds num_nodes*bs scalars — same as num_fine_dofs.
+        // Allocate prolongated at DOF level (scalar) so multiply() sees matching block dims.
+        // axpy() uses raw element count (x.size()), so it works correctly regardless of
+        // block metadata as long as prolongated.size() == x.size().
+        int sa_bs = this->A->get_block_dimy();
+        int num_fine_dofs = this->A->get_num_rows() * sa_bs;
+        VVector prolongated(num_fine_dofs);
+        prolongated.set_block_dimy(1);
+        prolongated.set_block_dimx(1);
+        prolongated.set_num_rows(num_fine_dofs);
+        fill(prolongated, types::util<ValueTypeB>::get_zero());
+        multiply(m_P_tent, e, prolongated, OWNED);
+
+        // Diagnostic: norm of prolongated correction
+        {
+            int n_p = prolongated.size();
+            double norm_p = 0.0;
+            std::vector<ValueTypeB> p_h(n_p);
+            cudaMemcpy(p_h.data(), prolongated.raw(), n_p * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < n_p; i++) { double a = (double)types::util<ValueTypeB>::abs(p_h[i]); norm_p += a * a; }
+            norm_p = sqrt(norm_p);
+            fprintf(stderr, "[VCYCLE-DBG] prolongateAndCorrect: ||P*e||=%e  prolongated.size=%d\n",
+                    norm_p, n_p);
+        }
+
+        ValueTypeB one = types::util<ValueTypeB>::get_one();
+        axpy(prolongated, x, one);
+
+        // Diagnostic: norm of x after correction
+        {
+            int n_x = x.size();
+            double norm_x = 0.0;
+            std::vector<ValueTypeB> x_h(n_x);
+            cudaMemcpy(x_h.data(), x.raw(), n_x * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < n_x; i++) { double a = (double)types::util<ValueTypeB>::abs(x_h[i]); norm_x += a * a; }
+            norm_x = sqrt(norm_x);
+            fprintf(stderr, "[VCYCLE-DBG] prolongateAndCorrect: ||x_after||=%e\n", norm_x);
+        }
+    }
     //this is dirty, but error scaling 2 and 3 do not have a specialized version. Instead, the general version sits in the 4x4 function
-    if ( this->m_error_scaling >= 2 )
+    else if ( this->m_error_scaling >= 2 )
     {
         prolongateAndApplyCorrection_4x4(e, bf, x, tmp);
     }
@@ -876,7 +1129,77 @@ void Aggregation_AMG_Level_Base<T_Config >::prolongateAndApplyCorrection(VVector
 template <class T_Config>
 void Aggregation_AMG_Level_Base<T_Config>::restrictResidual(VVector &r, VVector &rr)
 {
-    if (this->A->get_block_size() == 1)
+    // SA path: use the pre-computed transpose P^T for restriction.
+    // rr = P^T * r  (CSR SpMV with the stored transpose)
+    if (m_null_dim > 0 && m_P_tent_T.get_num_rows() > 0)
+    {
+        // Halo exchange on fine residual r before SA restriction SpMV.
+        // Columns of m_P_tent_T reference fine DOFs owned by other MPI ranks;
+        // their values must be present in r's halo before multiply() is called.
+        if (!this->A->is_matrix_singleGPU() && !this->isConsolidationLevel() && r.delayed_send == 0)
+        {
+            r.dirtybit = 1;
+            if (r.in_transfer & RECEIVING) { this->A->manager->exchange_halo_wait(r, r.tag); }
+            this->A->manager->exchange_halo_async(r, r.tag);
+            this->A->manager->exchange_halo_wait(r, r.tag);
+        }
+
+        // Diagnostic: norm of fine residual before restriction
+        {
+            int n_r = r.size();
+            double norm_r = 0.0;
+            std::vector<ValueTypeB> r_h(n_r);
+            cudaMemcpy(r_h.data(), r.raw(), n_r * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < n_r; i++) { double a = (double)types::util<ValueTypeB>::abs(r_h[i]); norm_r += a * a; }
+            norm_r = sqrt(norm_r);
+            fprintf(stderr, "[VCYCLE-DBG] restrictResidual: ||r_fine||=%e  r.size=%d  r.num_rows=%d  r.block_dimy=%d\n",
+                    norm_r, n_r, r.get_num_rows(), (int)r.get_block_dimy());
+        }
+
+        // m_P_tent_T is scalar (1x1 blocks): rows=num_coarse_dofs, cols=num_fine_dofs.
+        // When A has block_size > 1, r is a block vector (block_dimy=bs, num_rows=num_nodes).
+        // Temporarily reinterpret r as a scalar DOF-level vector so multiply() sees
+        // matching block dimensions.  The raw data layout is identical.
+        //
+        // After multiply(), rr.block_dimy is set to 1 (m_P_tent_T.block_dimx=1) but
+        // rr.num_rows may still reflect the old block layout (num_coarse_nodes with bs=3).
+        // We must fix rr.num_rows to num_coarse_dofs so the coarse solver sees the full RHS.
+        int sa_bs = this->A->get_block_dimy();
+        if (sa_bs > 1)
+        {
+            int saved_num_rows = r.get_num_rows();
+            short saved_dimy   = r.get_block_dimy();
+            short saved_dimx   = r.get_block_dimx();
+            r.set_num_rows(saved_num_rows * sa_bs);
+            r.set_block_dimy(1);
+            r.set_block_dimx(1);
+            multiply(m_P_tent_T, r, rr, OWNED);
+            r.set_num_rows(saved_num_rows);
+            r.set_block_dimy(saved_dimy);
+            r.set_block_dimx(saved_dimx);
+            // Fix rr metadata: multiply() sets block_dimy=1 but num_rows may be wrong.
+            rr.set_num_rows(m_P_tent_T.get_num_rows());
+            rr.set_block_dimy(1);
+            rr.set_block_dimx(1);
+        }
+        else
+        {
+            multiply(m_P_tent_T, r, rr, OWNED);
+        }
+
+        // Diagnostic: norm of coarse RHS after restriction
+        {
+            int n_rr = rr.size();
+            double norm_rr = 0.0;
+            std::vector<ValueTypeB> rr_h(n_rr);
+            cudaMemcpy(rr_h.data(), rr.raw(), n_rr * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < n_rr; i++) { double a = (double)types::util<ValueTypeB>::abs(rr_h[i]); norm_rr += a * a; }
+            norm_rr = sqrt(norm_rr);
+            fprintf(stderr, "[VCYCLE-DBG] restrictResidual: ||rr_coarse||=%e  rr.size=%d  rr.num_rows=%d  rr.block_dimy=%d\n",
+                    norm_rr, n_rr, rr.get_num_rows(), (int)rr.get_block_dimy());
+        }
+    }
+    else if (this->A->get_block_size() == 1)
     {
         restrictResidual_1x1(r, rr);
     }
@@ -1945,7 +2268,228 @@ template <class T_Config>
 void Aggregation_AMG_Level_Base<T_Config>::createCoarseVertices()
 {
     //Set the aggregates
-    this->m_selector->setAggregates(this->getA(), this->m_aggregates, this->m_aggregates_fine_idx, this->m_num_aggregates);
+    // Pass level index to selector via matrix parameter (used by MIS selector for aggressive_levels)
+    this->getA().template setParameter<int>("amg_level_index", this->getLevelIndex());
+
+    fprintf(stderr, "[SA-DBG] createCoarseVertices: num_rows=%d, block_dimy=%d\n",
+            (int)this->getA().get_num_rows(), (int)this->getA().get_block_dimy());
+
+    // ------------------------------------------------------------------
+    // Aggregate override: if a file was specified AND this is level 0,
+    // read node→aggregate mapping from the file instead of running MIS.
+    // File format (PETSc GAMG export):
+    //   # Level N: P is M x K  (bs_row=3 bs_col=6)
+    //   # fine_node  aggregate_id
+    //   <fine_node>  <aggregate_id>
+    //   ...
+    // ------------------------------------------------------------------
+    bool used_override = false;
+    if (!s_agg_override_file.empty() && this->getLevelIndex() == 0)
+    {
+        FILE *fp = fopen(s_agg_override_file.c_str(), "r");
+        if (!fp)
+        {
+            fprintf(stderr, "[SA-AGG-OVERRIDE] ERROR: cannot open '%s'\n",
+                    s_agg_override_file.c_str());
+        }
+        else
+        {
+            int num_rows = this->getA().get_num_rows();
+            std::vector<int> h_agg(num_rows, -1);
+            int max_agg = -1;
+            char line[256];
+            int parsed = 0;
+            while (fgets(line, sizeof(line), fp))
+            {
+                if (line[0] == '#') continue;  // skip comment lines
+                int fn, ai;
+                if (sscanf(line, "%d %d", &fn, &ai) == 2)
+                {
+                    if (fn >= 0 && fn < num_rows)
+                    {
+                        h_agg[fn] = ai;
+                        if (ai > max_agg) max_agg = ai;
+                        ++parsed;
+                    }
+                    else
+                    {
+                        fprintf(stderr, "[SA-AGG-OVERRIDE] WARNING: fine_node %d out of range [0,%d)\n",
+                                fn, num_rows);
+                    }
+                }
+            }
+            fclose(fp);
+
+            if (parsed != num_rows)
+            {
+                fprintf(stderr, "[SA-AGG-OVERRIDE] WARNING: parsed %d entries but num_rows=%d\n",
+                        parsed, num_rows);
+            }
+
+            this->m_num_aggregates = max_agg + 1;
+            // Upload to device
+            this->m_aggregates.resize(num_rows);
+            cudaMemcpy(this->m_aggregates.raw(), h_agg.data(),
+                       num_rows * sizeof(int), cudaMemcpyHostToDevice);
+            // m_aggregates_fine_idx is not used by the SA path; leave empty.
+            this->m_aggregates_fine_idx.resize(0);
+
+            fprintf(stderr, "[SA-AGG-OVERRIDE] Loaded %d aggregates from '%s' "
+                    "(num_rows=%d, num_aggs=%d)\n",
+                    parsed, s_agg_override_file.c_str(),
+                    num_rows, this->m_num_aggregates);
+            used_override = true;
+        }
+    }
+
+    if (!used_override)
+    {
+        // Compute aggregates via selector
+        this->m_selector->setAggregates(this->getA(), this->m_aggregates, this->m_aggregates_fine_idx, this->m_num_aggregates);
+    }
+
+    fprintf(stderr, "[SA-DBG] createCoarseVertices: m_num_aggregates=%d (coarsening ratio=%.2f)\n",
+            this->m_num_aggregates,
+            (this->m_num_aggregates > 0) ? (float)this->getA().get_num_rows() / (float)this->m_num_aggregates : 0.0f);
+
+    // ------------------------------------------------------------------
+    // Singleton handling: reassign size-1 aggregates to their strongest
+    // non-singleton neighbor's aggregate.
+    //
+    // Singletons (aggregates of size 1) arise at BC nodes where MIS
+    // propagation stalls.  If left as singletons with agg=-1, they get
+    // zero rows in P_tent and zero rows in P_smooth, making the
+    // preconditioner non-SPD (PCG diverges).
+    //
+    // Fix: merge each singleton into the aggregate of its strongest
+    // off-diagonal neighbor (by |A[i,j]| entry).  This is what PETSc
+    // GAMG does.  It may slightly enlarge some aggregates but preserves
+    // full coverage of the fine grid in the prolongator.
+    // ------------------------------------------------------------------
+    {
+        typedef ValueTypeA MatValueType;
+        typedef typename types::PODTypes<MatValueType>::type PodA;
+
+        int num_rows = this->getA().get_num_rows();
+        int A_block_nnz = this->getA().get_num_nz();
+        int bs = this->getA().get_block_dimy();
+
+        // Download aggregates and A sparsity to host
+        std::vector<int> h_agg(num_rows);
+        cudaMemcpy(h_agg.data(), this->m_aggregates.raw(),
+                   num_rows * sizeof(int), cudaMemcpyDeviceToHost);
+
+        std::vector<int> h_row(num_rows + 1);
+        std::vector<int> h_col(A_block_nnz);
+        cudaMemcpy(h_row.data(), this->getA().row_offsets.raw(),
+                   (num_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_col.data(), this->getA().col_indices.raw(),
+                   A_block_nnz * sizeof(int), cudaMemcpyDeviceToHost);
+
+        // Download A values to find strongest neighbor
+        int A_scalar_nnz = A_block_nnz * bs * bs;
+        std::vector<MatValueType> h_val(A_scalar_nnz);
+        cudaMemcpy(h_val.data(), this->getA().values.raw(),
+                   A_scalar_nnz * sizeof(MatValueType), cudaMemcpyDeviceToHost);
+
+        // Count aggregate sizes
+        std::vector<int> agg_size(this->m_num_aggregates, 0);
+        for (int i = 0; i < num_rows; i++) {
+            if (h_agg[i] >= 0 && h_agg[i] < this->m_num_aggregates)
+                agg_size[h_agg[i]]++;
+        }
+
+        // Iteratively reassign singletons to strongest non-singleton neighbor.
+        // Iterate because reassigning one singleton may make another non-singleton.
+        int n_singletons_total = 0;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (int v = 0; v < num_rows; v++) {
+                int my_agg = h_agg[v];
+                if (my_agg < 0 || agg_size[my_agg] != 1) continue;
+
+                // v is a singleton — find strongest non-singleton neighbor
+                double best_weight = -1.0;
+                int best_agg = -1;
+                for (int bnz = h_row[v]; bnz < h_row[v + 1]; ++bnz) {
+                    int j = h_col[bnz];
+                    if (j == v) continue;  // skip self
+                    int j_agg = h_agg[j];
+                    if (j_agg < 0 || agg_size[j_agg] < 1) continue;
+                    // Use Frobenius norm of the bs×bs block as weight
+                    double w = 0.0;
+                    for (int li = 0; li < bs; ++li)
+                        for (int lj = 0; lj < bs; ++lj) {
+                            double a = (double)static_cast<PodA>(
+                                types::util<MatValueType>::abs(
+                                    h_val[bnz * bs * bs + li * bs + lj]));
+                            w += a * a;
+                        }
+                    if (w > best_weight) {
+                        best_weight = w;
+                        best_agg = j_agg;
+                    }
+                }
+
+                if (best_agg >= 0) {
+                    // Reassign singleton v to best_agg
+                    agg_size[my_agg]--;   // now 0
+                    agg_size[best_agg]++;
+                    h_agg[v] = best_agg;
+                    n_singletons_total++;
+                    changed = true;
+                }
+                // If no non-singleton neighbor found, leave as singleton for now
+                // (will be compacted out below as agg=-1)
+            }
+        }
+
+        // Any remaining size-1 aggregates (isolated nodes with no non-singleton
+        // neighbors) are marked agg=-1 and excluded from the coarse grid.
+        int n_isolated = 0;
+        for (int v = 0; v < num_rows; v++) {
+            int my_agg = h_agg[v];
+            if (my_agg < 0) continue;
+            if (agg_size[my_agg] == 1) {
+                agg_size[my_agg] = 0;
+                h_agg[v] = -1;
+                n_isolated++;
+            }
+        }
+
+        // Renumber aggregates: compact out empty aggregates.
+        std::vector<int> agg_map(this->m_num_aggregates, -1);
+        int new_num_aggs = 0;
+        for (int a = 0; a < this->m_num_aggregates; a++) {
+            if (agg_size[a] > 0) {
+                agg_map[a] = new_num_aggs++;
+            }
+        }
+
+        // Apply renumbering to h_agg
+        for (int i = 0; i < num_rows; i++) {
+            if (h_agg[i] >= 0) {
+                h_agg[i] = agg_map[h_agg[i]];
+            }
+            // h_agg[i] == -1 stays -1 (truly isolated nodes)
+        }
+
+        this->m_num_aggregates = new_num_aggs;
+
+        // Upload renumbered aggregates to device
+        cudaMemcpy(this->m_aggregates.raw(), h_agg.data(),
+                   num_rows * sizeof(int), cudaMemcpyHostToDevice);
+
+        if (n_singletons_total > 0 || n_isolated > 0) {
+            fprintf(stderr, "[SA-SINGLETON] %d singletons merged into neighbors, "
+                    "%d isolated (no non-singleton neighbor, excluded). "
+                    "Final: %d aggregates\n",
+                    n_singletons_total, n_isolated, this->m_num_aggregates);
+        }
+
+        this->m_singleton_agg_flags.resize(0);
+    }
 
     if ( this->m_print_aggregation_info )
     {
@@ -1955,10 +2499,41 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseVertices()
     this->getA().template setParameter< int > ("aggregates_num", this->m_num_aggregates); // ptr to aaggregates
 }
 
+// Forward declarations of SA kernels used in createCoarseMatrices.
+// The full definitions appear later in this file (before smoothProlongator).
+template <typename IndexType>
+__global__ void build_SA_smoother_block_rowlen_kernel(
+    int num_block_rows, int block_size,
+    const IndexType * __restrict__ A_row_offsets,
+    IndexType * __restrict__ S_row_offsets);
+
+template <typename IndexType, typename ValueType>
+__global__ void expand_block_to_scalar_kernel(
+    int num_block_rows, int block_size,
+    const IndexType * __restrict__ A_row_offsets,
+    const IndexType * __restrict__ A_col_indices,
+    const ValueType * __restrict__ A_values,
+    const IndexType * __restrict__ As_row_offsets,
+    IndexType       * __restrict__ As_col_indices,
+    ValueType       * __restrict__ As_values);
+
+template <typename IndexType, typename ValueType>
+void launch_expand_block_to_scalar(
+    int num_block_rows, int block_size, int num_dofs,
+    const IndexType *A_row_offsets, const IndexType *A_col_indices,
+    const ValueType *A_values,
+    const IndexType *As_row_offsets,
+    IndexType *As_col_indices, ValueType *As_values);
+
 //  Creating the next level
 template <class T_Config>
 void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
 {
+    typedef typename TConfig::template setVecPrec<AMGX_vecInt64>::Type i64vec_value_type;
+    typedef Vector<i64vec_value_type> I64Vector;
+    typedef typename TConfig_h::template setVecPrec<AMGX_vecInt64>::Type i64vec_value_type_h;
+    typedef Vector<i64vec_value_type_h> I64Vector_h;
+
     Matrix<TConfig> &A = this->getA();
     Matrix<TConfig> &Ac = this->getNextLevel( MemorySpace( ) )->getA();
 
@@ -1994,9 +2569,610 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
         computeRestrictionOperator();
     }
 
+    // --- SA path: check if near-null space is available ---
+    // On the finest level, pull near-null space from the AMG object
+    fprintf(stderr, "[SA-DBG] aggregation_amg_level::setup: m_null_dim=%d, amg=%p, hasSANearNullSpace=%d\n",
+            m_null_dim, (void*)this->amg,
+            (this->amg != nullptr) ? (int)this->amg->hasSANearNullSpace() : -1);
+    if (m_null_dim == 0 && this->amg != nullptr && this->amg->hasSANearNullSpace())
+    {
+        const std::vector<double> &nns = this->amg->getSANearNullSpace();
+        int nd = this->amg->getSANullDim();
+        int nr = this->amg->getSANullRows();
+        fprintf(stderr, "[SA-DBG] Pulling near-null space from AMG: null_dim=%d, null_rows=%d, data_size=%zu\n",
+                nd, nr, nns.size());
+        setNearNullSpace(nd, nr, nns.data());
+    }
+    fprintf(stderr, "[SA-DBG] After pull: m_null_dim=%d\n", m_null_dim);
+
+    // Flag for distributed SA path — declared outside SA block so it's visible
+    // in the RAP and prepareNextLevelMatrix sections below.
+    bool sa_distributed = false;
+
+    // Variables for distributed RAP — declared at function scope so they are
+    // visible both inside the SA setup block and in the later RAP section.
+    int num_owned_fine_pts  = 0;
+    int num_owned_coarse_pts = 0;
+    IVector_h P_neighbors_h;
+    I64Vector_h P_halo_ranges_h;
+    I64Vector P_halo_ranges;
+    IVector_h P_halo_offsets_h;
+
+    // SA is only supported for real-valued types (float/double), not complex.
+    // Use sizeof check: for real types, sizeof(ValueTypeB) == sizeof(PODType);
+    // for complex types, sizeof(ValueTypeB) == 2 * sizeof(PODType).
+    fprintf(stderr, "[SA-DBG] SA condition: m_null_dim=%d, sizeof(ValueTypeB)=%zu, sizeof(PODType)=%zu\n",
+            m_null_dim, sizeof(ValueTypeB), sizeof(typename types::PODTypes<ValueTypeB>::type));
+    if (m_null_dim > 0 && sizeof(ValueTypeB) == sizeof(typename types::PODTypes<ValueTypeB>::type))
+    {
+        // SA path: build P_tent via QR, smooth it, then use for RAP
+        // === Compact aggregate IDs to remove gaps ===
+        // The selector may produce non-contiguous aggregate IDs (e.g., 0, 2, 5, 7
+        // with gaps at 1, 3, 4, 6). P_tent needs contiguous column indices.
+        {
+            int num_fine = m_aggregates.size();
+            // 1. Copy aggregates, sort, unique to find the set of used IDs
+            IVector sorted_aggs(m_aggregates);
+            thrust_wrapper::sort<TConfig::memSpace>(sorted_aggs.begin(), sorted_aggs.begin() + num_fine);
+            auto new_end = amgx::thrust::unique(sorted_aggs.begin(), sorted_aggs.begin() + num_fine);
+            int num_unique = (int)(new_end - sorted_aggs.begin());
+
+            if (num_unique < m_num_aggregates)
+            {
+
+                // 2. Create mapping: for each fine node, find its new contiguous ID
+                //    new_id = lower_bound position in sorted_unique array
+                IVector new_aggs(num_fine);
+                amgx::thrust::lower_bound(sorted_aggs.begin(), sorted_aggs.begin() + num_unique,
+                                           m_aggregates.begin(), m_aggregates.begin() + num_fine,
+                                           new_aggs.begin());
+
+                // 3. Copy back and update count
+                thrust_wrapper::copy<TConfig::memSpace>(new_aggs.begin(), new_aggs.begin() + num_fine,
+                                                         m_aggregates.begin());
+                m_num_aggregates = num_unique;
+            }
+        }
+        buildTentativeProlongator();
+
+        // --- Distributed SA: exchange halo rows of P_tent before smoothing ---
+        // In the distributed case (multi-GPU), P_tent was built for owned fine rows only.
+        // We need halo rows of P_tent (from neighbors) so that:
+        //   (a) smoothProlongator can compute S*P_tent correctly (S connects owned to halo)
+        //   (b) the Galerkin product P^T*A*P includes off-process contributions
+        // This follows the classical AMG distributed RAP pattern.
+        sa_distributed = !A.is_matrix_singleGPU();
+        num_owned_fine_pts  = 0;
+        num_owned_coarse_pts = m_num_aggregates * m_null_dim;  // coarse DOF count
+
+        if (sa_distributed)
+        {
+            int block_size = A.get_block_dimy();
+            // num_owned_fine_pts is DOF-level (P_tent rows = nodes * block_size)
+            num_owned_fine_pts = A.manager->halo_offsets[0] * block_size;
+
+            // 1. Set up m_P_tent.manager using initialize_manager
+            //    This does an allgather to compute part_offsets for the coarse level.
+            DistributedArranger<TConfig> *prep = new DistributedArranger<TConfig>;
+            prep->initialize_manager(A, m_P_tent, num_owned_coarse_pts);
+
+            // 2. Initialize Ac.manager from P_tent's manager info
+            //    (override what setNeighborAggregates partially set up)
+            IndexType num_parts = A.manager->get_num_partitions();
+            IndexType my_rank = A.manager->global_id();
+
+            if (Ac.manager == NULL)
+            {
+                Ac.manager = new DistributedManager<TConfig>();
+            }
+            Ac.manager->A = &Ac;
+            Ac.manager->setComms(A.manager->getComms());
+            Ac.manager->set_global_id(my_rank);
+            Ac.manager->set_num_partitions(num_parts);
+            Ac.manager->part_offsets_h = m_P_tent.manager->part_offsets_h;
+            Ac.manager->part_offsets = m_P_tent.manager->part_offsets;
+            Ac.manager->set_base_index(Ac.manager->part_offsets_h[my_rank]);
+            Ac.manager->set_index_range(num_owned_coarse_pts);
+            Ac.manager->num_rows_global = Ac.manager->part_offsets_h[num_parts];
+
+            // 3. P_tent has no halo columns initially (all columns are owned coarse DOFs).
+            //    local_to_global_map starts empty.
+            Ac.manager->local_to_global_map.resize(0);
+
+            // 4. Copy P manager info for exchange_halo_rows_P
+            P_neighbors_h = m_P_tent.manager->neighbors;  // empty initially
+            P_halo_ranges_h = m_P_tent.manager->halo_ranges_h;
+            P_halo_ranges = m_P_tent.manager->halo_ranges;
+            P_halo_offsets_h = m_P_tent.manager->halo_offsets;
+
+            // 5. Exchange halo rows of P_tent from neighbors.
+            //    This sends owned boundary rows of P_tent to neighbors and receives
+            //    halo rows from neighbors, appending them to m_P_tent.
+            //
+            //    pack_halo_rows_P uses A.manager->B2L_maps[i] as row indices into P
+            //    and A.manager->B2L_rings[i][ring] as the count of boundary rows.
+            //    These are node-level indices. When block_size > 1, P_tent is a
+            //    DOF-level scalar matrix (rows = nodes * block_size), so we must
+            //    temporarily expand B2L maps to DOF-level indices.
+            //
+            //    For block_size == 1, node indices == DOF indices, so no change needed.
+
+            // Save original B2L maps/rings and expand for block_size > 1
+            int num_neighbors = A.manager->num_neighbors();
+            std::vector<IVector> orig_B2L_maps;
+            std::vector<std::vector<VecInt_t>> orig_B2L_rings;
+
+            if (block_size > 1)
+            {
+                orig_B2L_maps.resize(num_neighbors);
+                orig_B2L_rings.resize(num_neighbors);
+                for (int i = 0; i < num_neighbors; i++)
+                {
+                    // Save originals
+                    orig_B2L_maps[i] = A.manager->B2L_maps[i];
+                    orig_B2L_rings[i].assign(A.manager->B2L_rings[i].begin(),
+                                              A.manager->B2L_rings[i].end());
+
+                    // Expand node-level B2L map to DOF-level:
+                    // Each node n maps to DOFs [n*bs, n*bs+1, ..., n*bs+(bs-1)]
+                    int node_count = (int)A.manager->B2L_maps[i].size();
+                    IVector_h node_B2L_h(A.manager->B2L_maps[i]);
+                    IVector_h dof_B2L_h(node_count * block_size);
+                    for (int j = 0; j < node_count; j++)
+                    {
+                        int node = node_B2L_h[j];
+                        for (int k = 0; k < block_size; k++)
+                        {
+                            dof_B2L_h[j * block_size + k] = node * block_size + k;
+                        }
+                    }
+                    A.manager->B2L_maps[i] = dof_B2L_h;
+
+                    // Scale B2L_rings counts by block_size
+                    for (size_t r = 0; r < A.manager->B2L_rings[i].size(); r++)
+                    {
+                        A.manager->B2L_rings[i][r] *= block_size;
+                    }
+                }
+            }
+
+            prep->exchange_halo_rows_P(A, m_P_tent,
+                                       Ac.manager->local_to_global_map,
+                                       P_neighbors_h, P_halo_ranges_h, P_halo_ranges,
+                                       P_halo_offsets_h,
+                                       Ac.manager->part_offsets_h, Ac.manager->part_offsets,
+                                       num_owned_coarse_pts,
+                                       Ac.manager->part_offsets_h[my_rank]);
+            cudaCheckError();
+
+            // Restore original B2L maps/rings after exchange
+            if (block_size > 1)
+            {
+                for (int i = 0; i < num_neighbors; i++)
+                {
+                    A.manager->B2L_maps[i] = orig_B2L_maps[i];
+                    A.manager->B2L_rings[i].assign(orig_B2L_rings[i].begin(),
+                                                    orig_B2L_rings[i].end());
+                }
+            }
+
+            delete prep;
+        }
+
+        smoothProlongator();
+
+        // Pass the SA-computed rho(D^{-1}A) to the Chebyshev smoother so that
+        // lambda_mode=4 can reuse it instead of running a separate power iteration.
+        // Must be done before setup_smoother() is called (which calls solver_setup()).
+        if (m_sa_rho > 0.0)
+        {
+            Solver<TConfig> *sm = this->getSmoother();
+            if (sm != nullptr)
+            {
+                Chebyshev_Solver<TConfig> *cheb =
+                    dynamic_cast<Chebyshev_Solver<TConfig>*>(sm);
+                if (cheb != nullptr)
+                    cheb->setSAEigenvalue(m_sa_rho);
+            }
+        }
+
+        // For the distributed case, set P_tent to show only owned fine rows
+        // for the transpose (R = P^T uses owned rows only, like classical path).
+        if (sa_distributed)
+        {
+            m_P_tent.set_initialized(0);
+            m_P_tent.set_num_rows(num_owned_fine_pts);
+            m_P_tent.addProps(CSR);
+            m_P_tent.set_initialized(1);
+        }
+
+        // Compute and store P^T for use in restrictResidual()
+        transpose(m_P_tent, m_P_tent_T);
+
+        // Near-null space propagation is deferred to after Ac is fully set up
+        // (including halo structure for distributed case). See below.
+    }
+    // --- End SA path ---
+
     Ac.set_initialized(0);
     Ac.copyAuxData(&A);
-    this->m_coarseAGenerator->computeAOperator(A, Ac, this->m_aggregates, this->m_R_row_offsets, this->m_R_column_indices, this->m_num_all_aggregates);
+    // SA path: use the real-valued smoothed P and P^T for the Galerkin triple product.
+    // The standard coarse-A generators use an implicit boolean P (aggregate injection),
+    // which is incorrect for SA.  CSR_Multiply::csr_galerkin_product handles real-valued P.
+    if (m_null_dim > 0 && m_P_tent.get_num_rows() > 0)
+    {
+        // ---------------------------------------------------------------
+        // Block-size expansion: csr_galerkin_product requires block_size==1
+        // for all three matrices.  P_tent is already scalar (DOF-level,
+        // 1x1 blocks).  When A has block_size > 1, expand it to scalar CSR
+        // A_scalar before the Galerkin product.
+        // ---------------------------------------------------------------
+        int sa_block_size = A.get_block_dimy();
+        Matrix<TConfig> A_scalar_storage;  // only used when block_size > 1
+        Matrix<TConfig> *A_for_rap = &A;   // points to A or A_scalar_storage
+
+        if (sa_block_size > 1)
+        {
+            int num_block_rows = A.get_num_rows();
+            int num_dofs       = num_block_rows * sa_block_size;
+            int A_block_nnz    = A.get_num_nz();
+            int As_nnz         = A_block_nnz * sa_block_size * sa_block_size;
+
+            A_scalar_storage.set_initialized(0);
+            A_scalar_storage.addProps(CSR);
+            A_scalar_storage.delProps(COO);
+            A_scalar_storage.delProps(DIAG);
+            A_scalar_storage.setColsReorderedByColor(false);
+            A_scalar_storage.resize(num_dofs, num_dofs, As_nnz, 1, 1, 1);
+
+            // Step 1: compute per-scalar-row lengths via existing kernel,
+            //         then exclusive scan -> As_row_offsets
+            {
+                const int threads = 256;
+                const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
+                thrust_wrapper::fill<TConfig::memSpace>(
+                    A_scalar_storage.row_offsets.begin(),
+                    A_scalar_storage.row_offsets.end(),
+                    (IndexType)0);
+                build_SA_smoother_block_rowlen_kernel<IndexType><<<blocks, threads>>>(
+                    num_block_rows, sa_block_size,
+                    A.row_offsets.raw(),
+                    A_scalar_storage.row_offsets.raw());
+                cudaCheckError();
+            }
+            thrust_wrapper::exclusive_scan<TConfig::memSpace>(
+                A_scalar_storage.row_offsets.begin(),
+                A_scalar_storage.row_offsets.end(),
+                A_scalar_storage.row_offsets.begin());
+            cudaCheckError();
+
+            // Step 2: fill col_indices and values
+            // Use wrapper to avoid CUDA <<<>>> template-argument parse issue.
+            {
+                typedef ValueTypeA MatValueType;
+                launch_expand_block_to_scalar<IndexType, MatValueType>(
+                    num_block_rows, sa_block_size, num_dofs,
+                    A.row_offsets.raw(),
+                    A.col_indices.raw(),
+                    A.values.raw(),
+                    A_scalar_storage.row_offsets.raw(),
+                    A_scalar_storage.col_indices.raw(),
+                    A_scalar_storage.values.raw());
+                cudaCheckError();
+            }
+
+            A_scalar_storage.set_initialized(1);
+            A_for_rap = &A_scalar_storage;
+        }
+
+        if (!sa_distributed)
+        {
+            // Single-GPU path: local-only triple product
+            CSR_Multiply<TConfig>::csr_galerkin_product(
+                m_P_tent_T, *A_for_rap, m_P_tent, Ac,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+            // DEBUG diagnostic: check Ac after RAP
+            {
+                typedef ValueTypeA MVal;
+                typedef typename types::PODTypes<MVal>::type PodM;
+                int Ac_nnz  = Ac.get_num_nz();
+                int Ac_rows = Ac.get_num_rows();
+                int Ac_cols = Ac.get_num_cols();
+                if (Ac_nnz > 0)
+                {
+                    std::vector<MVal> Ac_vals_h(Ac_nnz);
+                    cudaMemcpy(Ac_vals_h.data(), Ac.values.raw(),
+                               Ac_nnz * sizeof(MVal), cudaMemcpyDeviceToHost);
+                    std::vector<int> Ac_row_h(Ac_rows + 1);
+                    cudaMemcpy(Ac_row_h.data(), Ac.row_offsets.raw(),
+                               (Ac_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+                    std::vector<int> Ac_col_h(Ac_nnz);
+                    cudaMemcpy(Ac_col_h.data(), Ac.col_indices.raw(),
+                               Ac_nnz * sizeof(int), cudaMemcpyDeviceToHost);
+                    int nan_cnt = 0, inf_cnt = 0;
+                    double max_val = 0.0, min_diag = 1e300, max_diag = 0.0;
+                    // find diagonal entries
+                    for (int row = 0; row < Ac_rows; ++row)
+                    {
+                        for (int j = Ac_row_h[row]; j < Ac_row_h[row+1]; ++j)
+                        {
+                            double v = (double)static_cast<PodM>(types::util<MVal>::abs(Ac_vals_h[j]));
+                            if (std::isnan(v)) nan_cnt++;
+                            if (std::isinf(v)) inf_cnt++;
+                            if (v > max_val) max_val = v;
+                            if (Ac_col_h[j] == row)
+                            {
+                                if (v < min_diag) min_diag = v;
+                                if (v > max_diag) max_diag = v;
+                            }
+                        }
+                    }
+                    fprintf(stderr, "[DEBUG RAP] Ac: rows=%d cols=%d nnz=%d NaN=%d Inf=%d "
+                            "max_val=%.6e min_diag=%.6e max_diag=%.6e cond_diag=%.3e\n",
+                            Ac_rows, Ac_cols, Ac_nnz, nan_cnt, inf_cnt,
+                            max_val, min_diag, max_diag,
+                            (min_diag > 0.0 ? max_diag / min_diag : -1.0));
+
+                    // Dump Ac (scalar, before createBlockGraph) in Matrix Market format.
+                    // One file per level: amgx_Ac_level<L>.mtx
+                    // This allows offline eigenvalue analysis to check SPD-ness.
+                    {
+                        char ac_fname[256];
+                        snprintf(ac_fname, sizeof(ac_fname),
+                                 "/pscratch/sd/m/madams/amgx_Ac_level%d.mtx",
+                                 this->getLevelIndex());
+                        FILE *fp = fopen(ac_fname, "w");
+                        if (fp)
+                        {
+                            fprintf(fp, "%%%%MatrixMarket matrix coordinate real general\n");
+                            fprintf(fp, "%d %d %d\n", Ac_rows, Ac_cols, Ac_nnz);
+                            for (int row = 0; row < Ac_rows; ++row)
+                            {
+                                for (int j = Ac_row_h[row]; j < Ac_row_h[row+1]; ++j)
+                                {
+                                    // Extract signed scalar value via memcpy
+                                    PodM pod_v;
+                                    memcpy(&pod_v, &Ac_vals_h[j], sizeof(PodM));
+                                    fprintf(fp, "%d %d %.17e\n",
+                                            row + 1, Ac_col_h[j] + 1, (double)pod_v);
+                                }
+                            }
+                            fclose(fp);
+                            fprintf(stderr, "[DEBUG RAP] Ac (level %d, scalar %d×%d) dumped to %s\n",
+                                    this->getLevelIndex(), Ac_rows, Ac_cols, ac_fname);
+                        }
+                        else
+                        {
+                            fprintf(stderr, "[DEBUG RAP] WARNING: could not open %s for writing\n",
+                                    ac_fname);
+                        }
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Regularize Ac:
+            // 1. Set zero diagonal entries to 1.0 (degenerate coarse DOFs).
+            // 2. Shift ALL diagonals by avg_diag * 1e-6 to handle
+            //    semi-definite coarse matrices (rigid body modes in the
+            //    null space of Ac).  This ensures DENSE_LU_SOLVER can
+            //    factor the matrix.
+            // ---------------------------------------------------------------
+            {
+                typedef ValueTypeA MVal;
+                typedef typename types::PODTypes<MVal>::type PodM;
+                int Ac_rows = Ac.get_num_rows();
+                int Ac_nnz  = Ac.get_num_nz();
+                if (Ac_nnz > 0 && Ac_rows > 0)
+                {
+                    std::vector<MVal> vals_h(Ac_nnz);
+                    std::vector<int>  row_h(Ac_rows + 1), col_h(Ac_nnz);
+                    cudaMemcpy(vals_h.data(), Ac.values.raw(), Ac_nnz * sizeof(MVal), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(row_h.data(), Ac.row_offsets.raw(), (Ac_rows+1) * sizeof(int), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(col_h.data(), Ac.col_indices.raw(), Ac_nnz * sizeof(int), cudaMemcpyDeviceToHost);
+
+                    // Find diagonal positions and compute average
+                    std::vector<int> diag_pos(Ac_rows, -1);
+                    double diag_sum = 0.0;
+                    int n_diag = 0, n_zero = 0;
+                    for (int row = 0; row < Ac_rows; ++row)
+                    {
+                        for (int j = row_h[row]; j < row_h[row+1]; ++j)
+                        {
+                            if (col_h[j] == row)
+                            {
+                                diag_pos[row] = j;
+                                PodM dval = static_cast<PodM>(types::util<MVal>::abs(vals_h[j]));
+                                if (dval < 1e-14)
+                                {
+                                    PodM one_pod = static_cast<PodM>(1.0);
+                                    memcpy(&vals_h[j], &one_pod, sizeof(PodM));
+                                    n_zero++;
+                                    diag_sum += 1.0;
+                                }
+                                else
+                                {
+                                    diag_sum += (double)dval;
+                                }
+                                n_diag++;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Shift all diagonals by avg_diag * 1e-6
+                    double avg_diag = (n_diag > 0) ? diag_sum / n_diag : 1.0;
+                    PodM shift = static_cast<PodM>(avg_diag * 1e-6);
+                    for (int row = 0; row < Ac_rows; ++row)
+                    {
+                        if (diag_pos[row] >= 0)
+                        {
+                            PodM d;
+                            memcpy(&d, &vals_h[diag_pos[row]], sizeof(PodM));
+                            d += shift;
+                            memcpy(&vals_h[diag_pos[row]], &d, sizeof(PodM));
+                        }
+                    }
+
+                    cudaMemcpy(Ac.values.raw(), vals_h.data(), Ac_nnz * sizeof(MVal), cudaMemcpyHostToDevice);
+                    if (n_zero > 0 || true)
+                    {
+                        fprintf(stderr, "[SA-FIX] Ac (%d×%d): %d zero diags→1.0, "
+                                "shift=%.2e (avg_diag=%.2e)\n",
+                                Ac_rows, Ac_rows, n_zero,
+                                avg_diag * 1e-6, avg_diag);
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Block-compress scalar Ac → block-null_dim Ac so that the next
+            // MIS coarsening operates on aggregate-level block nodes (like
+            // PETSc GAMG which annotates Ac with block_size=null_dim).
+            //
+            // The coarse Ac block size is the column block size of P, which
+            // equals m_null_dim (the number of near-null vectors).
+            // ---------------------------------------------------------------
+            if (m_null_dim > 1)
+            {
+                this->createBlockGraph(Ac, m_null_dim);
+            }
+        }
+        else
+        {
+            // ---------------------------------------------------------------
+            // Distributed SA path: follow the classical AMG RAP pattern.
+            // P_tent has halo rows appended (from exchange_halo_rows_P above),
+            // but num_rows is set to owned only. The CSR arrays still contain
+            // halo data, so the galerkin product can access halo rows of P
+            // via column indices of A that reference halo fine nodes.
+            // ---------------------------------------------------------------
+
+            // Initialize CSR workspace (csr_workspace_create only exists on device)
+            typedef TemplateConfig<AMGX_device, vecPrec, matPrec, indPrec> TConfig_d_rap;
+            void *wk = AMG_Level<TConfig>::amg->getCsrWorkspace();
+            if (wk == NULL)
+            {
+                wk = CSR_Multiply<TConfig_d_rap>::csr_workspace_create(
+                    *(AMG_Level<TConfig>::amg->m_cfg),
+                    AMG_Level<TConfig>::amg->m_cfg_scope);
+                AMG_Level<TConfig>::amg->setCsrWorkspace(wk);
+            }
+
+            // For distributed: A_scalar_storage needs the manager from A
+            // so that halo columns are correctly referenced.
+            if (sa_block_size > 1)
+            {
+                A_scalar_storage.manager = A.manager;
+            }
+
+            // Compute RAP_full = R * A * P (local computation including halo contributions)
+            // RAP_full will have num_owned_coarse_pts rows for owned coarse nodes,
+            // plus extra rows for halo coarse nodes (from halo rows of P_tent_T).
+            Matrix<TConfig> RAP_full;
+            RAP_full.set_initialized(0);
+            A.setView(OWNED);
+            if (sa_block_size > 1)
+                A_scalar_storage.setView(OWNED);
+            CSR_Multiply<TConfig>::csr_galerkin_product(
+                m_P_tent_T, *A_for_rap, m_P_tent, RAP_full,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, wk);
+            RAP_full.set_initialized(1);
+
+            // Update m_P_tent.manager with info modified by exchange_halo_rows_P.
+            // exchange_RAP_ext -> pack_halo_rows_RAP uses P.manager->neighbors,
+            // P.manager->halo_offsets, P.manager->base_index(), etc.
+            m_P_tent.manager->neighbors = P_neighbors_h;
+            m_P_tent.manager->halo_offsets = P_halo_offsets_h;
+            m_P_tent.manager->halo_ranges_h = P_halo_ranges_h;
+            m_P_tent.manager->halo_ranges = P_halo_ranges;
+
+            // Exchange RAP rows: send extra rows (halo coarse) to neighbors,
+            // receive contributions from neighbors, and assemble final Ac.
+            DistributedArranger<TConfig> *prep2 = new DistributedArranger<TConfig>;
+            prep2->exchange_RAP_ext(Ac, RAP_full, A, m_P_tent,
+                                    P_halo_offsets_h,
+                                    Ac.manager->local_to_global_map,
+                                    P_neighbors_h, P_halo_ranges_h, P_halo_ranges,
+                                    Ac.manager->part_offsets_h, Ac.manager->part_offsets,
+                                    num_owned_coarse_pts,
+                                    Ac.manager->part_offsets_h[A.manager->global_id()],
+                                    wk);
+            delete prep2;
+
+            // Column compression: remove unused halo columns from Ac.
+            // Some halo columns in local_to_global_map may not appear in
+            // the owned rows of Ac after assembly. This mirrors the classical
+            // path's column compression (classical_amg_level.cu).
+            IndexType nrow = Ac.get_num_rows();
+            IndexType ncol = Ac.get_num_cols();
+            IndexType nl2g = ncol - nrow;
+
+            if (nl2g > 0)
+            {
+                IVector l2g_p(nl2g + 1, 0);  // +1 for exclusive_scan
+                I64Vector l2g_t(nl2g, 0);
+                IndexType nblocks = std::min(4096, (int)((nrow + 127) / 128));
+
+                // Step 1: Flag which halo columns are referenced
+                if (nblocks > 0)
+                {
+                    sa_flag_halo_columns_kernel<IndexType><<<nblocks, 128>>>(
+                        nrow, Ac.row_offsets.raw(), Ac.col_indices.raw(), l2g_p.raw());
+                }
+                cudaCheckError();
+
+                // Step 2: Exclusive scan to get new positions
+                thrust_wrapper::exclusive_scan<TConfig::memSpace>(
+                    l2g_p.begin(), l2g_p.end(), l2g_p.begin());
+                int new_nl2g = l2g_p[nl2g];
+
+                // Step 3: Compress column indices
+                if (nblocks > 0)
+                {
+                    sa_compress_halo_columns_kernel<IndexType><<<nblocks, 128>>>(
+                        nrow, Ac.row_offsets.raw(), Ac.col_indices.raw(), l2g_p.raw());
+                }
+                cudaCheckError();
+
+                // Step 4: Adjust matrix size
+                Ac.set_initialized(0);
+                Ac.set_num_cols(nrow + new_nl2g);
+                Ac.set_initialized(1);
+
+                // Step 5: Compress local_to_global_map
+                nblocks = std::min(4096, (int)((nl2g + 127) / 128));
+                if (nblocks > 0)
+                {
+                    sa_compress_l2g_kernel<IndexType, int64_t><<<nblocks, 128>>>(
+                        nl2g, Ac.manager->local_to_global_map.raw(),
+                        l2g_t.raw(), l2g_p.raw());
+                }
+                cudaCheckError();
+                amgx::thrust::copy(l2g_t.begin(), l2g_t.begin() + new_nl2g,
+                                   Ac.manager->local_to_global_map.begin());
+                cudaCheckError();
+                Ac.manager->local_to_global_map.resize(new_nl2g);
+            }
+
+            // Finalize the distributed coarse matrix:
+            // renumberMatrixOneRing creates B2L maps and sets up halo structure
+            Ac.set_initialized(0);
+            Ac.manager->renumberMatrixOneRing(this->isReuseLevel() ? 1 : 0);
+            Ac.manager->createOneRingHaloRows();
+            Ac.manager->getComms()->set_neighbors(Ac.manager->num_neighbors());
+            Ac.setView(OWNED);
+            Ac.set_initialized(1);
+
+            // Restore A to ALL view for consistency
+            A.setView(ALL);
+        }
+    }
+    else
+    {
+        this->m_coarseAGenerator->computeAOperator(A, Ac, this->m_aggregates, this->m_R_row_offsets, this->m_R_column_indices, this->m_num_all_aggregates);
+    }
     Ac.setColsReorderedByColor(false);
     Ac.setView(FULL);
 
@@ -2007,13 +3183,158 @@ void Aggregation_AMG_Level_Base<T_Config>::createCoarseMatrices()
     }
     else
     {
-        this->prepareNextLevelMatrix(A, Ac);
+        // For the distributed SA path, the coarse matrix is already finalized
+        // (renumberMatrixOneRing + createOneRingHaloRows were called above).
+        // Only call prepareNextLevelMatrix for non-SA or single-GPU paths.
+        if (!(m_null_dim > 0 && m_P_tent.get_num_rows() > 0 && sa_distributed))
+        {
+            this->prepareNextLevelMatrix(A, Ac);
+        }
     }
 
     A.setView(OWNED);
     Ac.setView(OWNED);
 
-    this->m_next_level_size = this->m_num_all_aggregates * Ac.get_block_dimy();
+    if (sa_distributed && m_null_dim > 0)
+    {
+        // For distributed SA, m_next_level_size uses the FULL view of Ac
+        int size, offset;
+        Ac.getOffsetAndSizeForView(FULL, &offset, &size);
+        this->m_next_level_size = size * Ac.get_block_dimy();
+    }
+    else if (m_null_dim > 0 && A.get_block_dimy() > 1)
+    {
+        // Block SA path: after block-compression, Ac has num_rows = num_aggs
+        // and block_dimy = null_dim.  The next level size is num_aggs * null_dim.
+        this->m_next_level_size = Ac.get_num_rows() * Ac.get_block_dimy();
+    }
+    else
+    {
+        this->m_next_level_size = this->m_num_all_aggregates * Ac.get_block_dimy();
+    }
+
+    // ---------------------------------------------------------------
+    // Propagate coarse near-null space to the next level.
+    // This is done after Ac is fully set up so that in the distributed
+    // case we can exchange halo aggregate near-null space values.
+    // ---------------------------------------------------------------
+    fprintf(stderr, "[SA-PROP] level=%d  m_null_dim=%d  m_coarse_nns_size=%zu  "
+            "m_num_aggregates=%d\n",
+            this->getLevelIndex(), m_null_dim,
+            (size_t)m_coarse_near_null_space.size(), m_num_aggregates);
+    if (m_null_dim > 0 && m_coarse_near_null_space.size() > 0)
+    {
+        AMG_Level<TConfig> *next = this->getNextLevel(MemorySpace());
+        Aggregation_AMG_Level_Base<TConfig> *next_agg =
+            dynamic_cast<Aggregation_AMG_Level_Base<TConfig>*>(next);
+        fprintf(stderr, "[SA-PROP] level=%d  next=%p  next_agg=%p\n",
+                this->getLevelIndex(), (void*)next, (void*)next_agg);
+        if (next_agg != nullptr)
+        {
+            int num_owned_aggs = m_num_aggregates;
+            int coarse_dofs_owned = num_owned_aggs * m_null_dim;
+
+            if (sa_distributed && Ac.manager != nullptr &&
+                Ac.manager->num_neighbors() > 0)
+            {
+                // ---------------------------------------------------
+                // Distributed case (all null_dim values):
+                // Exchange halo near-null space values so the next
+                // level's buildTentativeProlongator() can look up
+                // near-null space for halo aggregates.
+                //
+                // The coarse near-null space from QR has layout:
+                //   [vec_0(agg_0..agg_{N-1}), vec_1(agg_0..agg_{N-1}), ...]
+                // where N = num_owned_aggs.  We need to expand each
+                // vector to include halo aggregate values, producing:
+                //   [vec_0(agg_0..agg_{T-1}), vec_1(agg_0..agg_{T-1}), ...]
+                // where T = total_coarse_nodes (owned + halo).
+                //
+                // We exchange each near-null vector separately using
+                // exchange_halo(), which handles one scalar per node.
+                // ---------------------------------------------------
+
+                // Total coarse nodes including halos
+                int num_halo_offsets = Ac.manager->num_halo_offsets();
+                int total_coarse_nodes = (num_halo_offsets > 0)
+                    ? Ac.manager->halo_offset(num_halo_offsets - 1)
+                    : num_owned_aggs;
+
+                // Output: null_dim blocks of total_coarse_nodes each
+                int total_nns_size = m_null_dim * total_coarse_nodes;
+                std::vector<double> h_coarse_nns_double(total_nns_size);
+
+                // Temporary device vector for a single near-null vector
+                VVector nns_with_halo(total_coarse_nodes);
+
+                for (int v = 0; v < m_null_dim; ++v)
+                {
+                    // Copy owned values for vector v into the owned portion.
+                    // Source: m_coarse_near_null_space at offset v * num_owned_aggs
+                    cudaMemcpy(nns_with_halo.raw(),
+                               m_coarse_near_null_space.raw() + v * num_owned_aggs,
+                               num_owned_aggs * sizeof(ValueTypeB),
+                               cudaMemcpyDeviceToDevice);
+                    cudaCheckError();
+
+                    // Mark dirty so exchange_halo sends data
+                    nns_with_halo.dirtybit = 1;
+                    nns_with_halo.set_block_dimx(1);
+                    nns_with_halo.set_block_dimy(1);
+
+                    // Exchange halo values for this near-null vector.
+                    // Use distinct tags per vector to avoid message confusion.
+                    Ac.manager->exchange_halo(nns_with_halo, 7799 + v);
+
+                    // Copy full vector (owned + halo) to host and convert
+                    // to double for setNearNullSpace.
+                    std::vector<ValueTypeB> h_vtmp(total_coarse_nodes);
+                    cudaMemcpy(h_vtmp.data(), nns_with_halo.raw(),
+                               total_coarse_nodes * sizeof(ValueTypeB),
+                               cudaMemcpyDeviceToHost);
+                    cudaCheckError();
+
+                    int dst_offset = v * total_coarse_nodes;
+                    for (int i = 0; i < total_coarse_nodes; ++i)
+                    {
+                        h_coarse_nns_double[dst_offset + i] = static_cast<double>(
+                            *reinterpret_cast<typename types::PODTypes<ValueTypeB>::type*>(&h_vtmp[i]));
+                    }
+                }
+
+                next_agg->setNearNullSpace(m_null_dim, total_coarse_nodes, h_coarse_nns_double.data());
+            }
+            else
+            {
+                // ---------------------------------------------------
+                // Single-GPU case (no halo neighbors):
+                // Propagate owned near-null space only.
+                // ---------------------------------------------------
+                int total = coarse_dofs_owned * m_null_dim;
+
+                std::vector<ValueTypeB> h_vtmp(total);
+                cudaMemcpy(h_vtmp.data(), m_coarse_near_null_space.raw(),
+                           total * sizeof(ValueTypeB), cudaMemcpyDeviceToHost);
+                cudaCheckError();
+
+                std::vector<double> h_coarse_nns_double(total);
+                for (int i = 0; i < total; ++i)
+                {
+                    h_coarse_nns_double[i] = static_cast<double>(
+                        *reinterpret_cast<typename types::PODTypes<ValueTypeB>::type*>(&h_vtmp[i]));
+                }
+
+                fprintf(stderr, "[SA-PROP] level=%d  single-GPU: calling setNearNullSpace("
+                        "null_dim=%d, num_rows=%d, total_data=%d)\n",
+                        this->getLevelIndex(), m_null_dim, coarse_dofs_owned,
+                        (int)h_coarse_nns_double.size());
+                next_agg->setNearNullSpace(m_null_dim, coarse_dofs_owned, h_coarse_nns_double.data());
+                fprintf(stderr, "[SA-PROP] level=%d  setNearNullSpace done; "
+                        "next_agg->m_null_dim=%d\n",
+                        this->getLevelIndex(), next_agg->getNullDim());
+            }
+        }
+    }
 
     if (this->m_print_aggregation_info)
     {
@@ -2642,12 +3963,1176 @@ void Aggregation_AMG_Level_Base<T_Config>::consolidateCoarseGridMatrix()
 }
 
 // -------------------------------------------------------------
+// Near-null space helpers
+// -------------------------------------------------------------
+
+// Device-side scalar conversion: double -> ValueType.
+// For real types (float, double) this is a plain cast.
+// For complex types (cuComplex, cuDoubleComplex) the imaginary part is zero.
+template <typename ValueType>
+static __device__ __inline__ ValueType double_to_valuetype(double v)
+{
+    return static_cast<ValueType>(v);   // works for float and double
+}
+
+template <>
+__device__ __inline__ cuComplex double_to_valuetype<cuComplex>(double v)
+{
+    return make_cuComplex(static_cast<float>(v), 0.f);
+}
+
+template <>
+__device__ __inline__ cuDoubleComplex double_to_valuetype<cuDoubleComplex>(double v)
+{
+    return make_cuDoubleComplex(v, 0.);
+}
+
+// Kernel: copy-convert double host data to device ValueType vector.
+// Each thread handles one element.
+template <typename ValueType>
+__global__
+void copy_double_to_valuetype_kernel(const double * __restrict__ src,
+                                     ValueType * __restrict__ dst,
+                                     int n)
+{
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    if (tid < n)
+        dst[tid] = double_to_valuetype<ValueType>(src[tid]);
+}
+
+// setNearNullSpace: upload host double data to device VVector.
+// Works for both float and double solver precision.
+template <class T_Config>
+void Aggregation_AMG_Level_Base<T_Config>::setNearNullSpace(
+    int null_dim, int num_rows, const double *data)
+{
+    m_null_dim = null_dim;
+    int total = null_dim * num_rows;
+
+    // Allocate a temporary host double vector and copy to device
+    thrust::device_vector<double> d_tmp(data, data + total);
+
+    // Resize the device near-null space vector
+    m_near_null_space.resize(total);
+
+    // Launch kernel to convert double -> ValueTypeB
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    copy_double_to_valuetype_kernel<ValueTypeB><<<blocks, threads>>>(
+        thrust::raw_pointer_cast(d_tmp.data()),
+        m_near_null_space.raw(),
+        total);
+    cudaCheckError();
+}
+
+// ---------------------------------------------------------------
+// Kernels for buildTentativeProlongator
+// ---------------------------------------------------------------
+
+// Expand node-level aggregates to DOF-level aggregates.
+// For DOF row d, dof_aggregates[d] = aggregates[d / block_size].
+template <typename IndexType>
+__global__
+void expand_aggregates_kernel(const IndexType * __restrict__ aggregates,
+                              IndexType * __restrict__ dof_aggregates,
+                              int num_fine_rows,
+                              int block_size)
+{
+    for (int d = blockDim.x * blockIdx.x + threadIdx.x;
+         d < num_fine_rows;
+         d += gridDim.x * blockDim.x)
+    {
+        dof_aggregates[d] = aggregates[d / block_size];
+    }
+}
+
+// Fill col_indices and values for P_tent (uniform-nnz version).
+// Every DOF row i gets null_dim entries: col = agg*null_dim + k, value from P_tent_vals.
+// Excluded rows (aggregates[node]==-1, Approach A) get col=0..null_dim-1 and zero values.
+template <typename IndexType, typename ValueTypeIn, typename ValueTypeOut>
+__global__
+void fill_P_tent_csr_kernel(
+    int num_fine_rows,
+    int null_dim,
+    int block_size,
+    const IndexType * __restrict__ aggregates,
+    const ValueTypeIn * __restrict__ P_tent_vals,
+    IndexType * __restrict__ col_indices,
+    ValueTypeOut * __restrict__ values)
+{
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x;
+         i < num_fine_rows;
+         i += gridDim.x * blockDim.x)
+    {
+        int node = i / block_size;
+        int agg  = aggregates[node];
+        bool is_excluded = (agg < 0);
+
+        for (int k = 0; k < null_dim; ++k)
+        {
+            if (is_excluded)
+            {
+                // Excluded node (Approach A): dummy column index, zero value.
+                col_indices[i * null_dim + k] = k;  // valid col to avoid OOB
+                values[i * null_dim + k] = ValueTypeOut{};
+            }
+            else
+            {
+                col_indices[i * null_dim + k] = agg * null_dim + k;
+                ValueTypeIn tmp = P_tent_vals[i * null_dim + k];
+                ValueTypeOut *dst = &values[i * null_dim + k];
+                if (sizeof(ValueTypeIn) == sizeof(ValueTypeOut))
+                    *dst = *reinterpret_cast<ValueTypeOut*>(&tmp);
+                else
+                {
+                    typename types::PODTypes<ValueTypeIn>::type pod_in =
+                        *reinterpret_cast<typename types::PODTypes<ValueTypeIn>::type*>(&tmp);
+                    typename types::PODTypes<ValueTypeOut>::type pod_out =
+                        static_cast<typename types::PODTypes<ValueTypeOut>::type>(pod_in);
+                    *dst = *reinterpret_cast<ValueTypeOut*>(&pod_out);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// buildTentativeProlongator
+// ---------------------------------------------------------------
+
+template <class T_Config>
+void Aggregation_AMG_Level_Base<T_Config>::buildTentativeProlongator()
+{
+    fprintf(stderr, "[SA-TENT] level=%d  m_null_dim=%d  m_near_null_space.size=%zu  "
+            "m_num_aggregates=%d  A.num_rows=%d  A.block_dimy=%d\n",
+            this->getLevelIndex(), m_null_dim, (size_t)m_near_null_space.size(),
+            m_num_aggregates, this->getA().get_num_rows(), this->getA().get_block_dimy());
+    if (m_null_dim <= 0)
+    {
+        FatalError("buildTentativeProlongator: null_dim not set", AMGX_ERR_BAD_PARAMETERS);
+    }
+
+    if (m_near_null_space.size() == 0)
+    {
+        FatalError("buildTentativeProlongator: near-null space not set", AMGX_ERR_BAD_PARAMETERS);
+    }
+
+    Matrix<TConfig> &A = this->getA();
+    int block_size = A.get_block_dimy();
+    // In the distributed case, only build P_tent for owned fine rows.
+    // The near-null space is only available for owned DOFs, and halo rows
+    // of P_tent will be obtained via exchange_halo_rows_P.
+    int num_nodes  = (!A.is_matrix_singleGPU() && A.manager != NULL)
+                     ? A.manager->halo_offsets[0]
+                     : A.get_num_rows();       // block-rows (nodes)
+    int num_fine_rows = num_nodes * block_size;  // total DOF rows
+    int num_coarse_cols = m_num_aggregates * m_null_dim;
+    int nnz_uniform = num_fine_rows * m_null_dim;
+
+    // ----------------------------------------------------------
+    // 1. Expand node-level aggregates to DOF-level aggregates.
+    // ----------------------------------------------------------
+    IVector dof_aggregates(num_fine_rows);
+    {
+        const int threads = 256;
+        const int blocks = std::min(4096, (num_fine_rows + threads - 1) / threads);
+        expand_aggregates_kernel<IndexType><<<blocks, threads>>>(
+            m_aggregates.raw(),
+            dof_aggregates.raw(),
+            num_fine_rows,
+            block_size);
+        cudaCheckError();
+    }
+
+    // ----------------------------------------------------------
+    // 2. Build aggregate row lists at DOF level (all rows included,
+    //    singletons included — they contribute to QR but their
+    //    P_tent values will be zeroed after QR).
+    // ----------------------------------------------------------
+    IVector agg_row_offsets(m_num_aggregates + 1);
+    IVector agg_rows(num_fine_rows);
+
+    build_agg_row_lists(num_fine_rows,
+                        m_num_aggregates,
+                        dof_aggregates.raw(),
+                        agg_row_offsets.raw(),
+                        agg_rows.raw());
+
+    // ----------------------------------------------------------
+    // 3. Run batched QR on the near-null space.
+    //    P_tent_vals uses the uniform layout (nnz_uniform entries).
+    // ----------------------------------------------------------
+    VVector P_tent_vals(nnz_uniform);
+    VVector R_out(m_num_aggregates * m_null_dim * m_null_dim);
+
+    batched_qr<ValueTypeB>(m_num_aggregates,
+                           m_null_dim,
+                           num_fine_rows,
+                           agg_row_offsets.raw(),
+                           agg_rows.raw(),
+                           m_near_null_space.raw(),
+                           P_tent_vals.raw(),
+                           R_out.raw());
+
+    // ----------------------------------------------------------
+    // 4. Build P_tent CSR matrix with uniform nnz (null_dim per row).
+    //    Excluded rows (aggregates[node]==-1, Approach A) get
+    //    zero values with dummy column indices.
+    // ----------------------------------------------------------
+    m_P_tent.set_initialized(0);
+    m_P_tent.addProps(CSR);
+    m_P_tent.resize(num_fine_rows, num_coarse_cols, nnz_uniform, 1, 1, 1);
+
+    // Fill uniform row_offsets: row_offsets[i] = i * null_dim.
+    {
+        amgx::thrust::transform(
+            amgx::thrust::counting_iterator<int>(0),
+            amgx::thrust::counting_iterator<int>(num_fine_rows + 1),
+            m_P_tent.row_offsets.begin(),
+            amgx::thrust::placeholders::_1 * m_null_dim);
+        cudaCheckError();
+    }
+
+    {
+        const int threads = 256;
+        const int blocks = std::min(4096, (num_fine_rows + threads - 1) / threads);
+        fill_P_tent_csr_kernel<<<blocks, threads>>>(
+            num_fine_rows,
+            m_null_dim,
+            block_size,
+            m_aggregates.raw(),
+            P_tent_vals.raw(),
+            m_P_tent.col_indices.raw(),
+            m_P_tent.values.raw());
+        cudaCheckError();
+    }
+
+    m_P_tent.set_initialized(1);
+
+    // Count excluded rows (agg == -1)
+    int n_excluded = 0;
+    {
+        std::vector<int> h_agg(num_nodes);
+        cudaMemcpy(h_agg.data(), m_aggregates.raw(),
+                   num_nodes * sizeof(int), cudaMemcpyDeviceToHost);
+        for (int i = 0; i < num_nodes; i++)
+            if (h_agg[i] < 0) n_excluded++;
+    }
+
+    fprintf(stderr, "[SA-PTENT] num_fine_rows=%d nnz=%d (uniform, %d excluded nodes with zero P_tent rows)\n",
+            num_fine_rows, nnz_uniform, n_excluded);
+
+    // ----------------------------------------------------------
+    // 5. Store coarse near-null space (R factors from QR)
+    //    Reshape from per-aggregate column-major R to global
+    //    column-major B_c layout for the next coarser level.
+    // ----------------------------------------------------------
+    int total_R = m_num_aggregates * m_null_dim * m_null_dim;
+    m_coarse_near_null_space.resize(total_R);
+    {
+        const int threads = 256;
+        const int blocks = std::min(4096, (total_R + threads - 1) / threads);
+        reshape_R_to_coarse_B_kernel<ValueTypeB><<<blocks, threads>>>(
+            m_num_aggregates,
+            m_null_dim,
+            R_out.raw(),
+            m_coarse_near_null_space.raw());
+        cudaCheckError();
+    }
+}
+
+// ---------------------------------------------------------------
+// Kernel for estimateSADampingFactor: apply point D^{-1} to a vector
+// ---------------------------------------------------------------
+
+template <typename IndexType, typename MatValueType, typename VecValueType>
+__global__
+void apply_point_dinv_kernel(
+    int num_dofs,
+    int block_size,
+    const IndexType * __restrict__ diag_offsets,  // A.diag, length num_rows
+    const MatValueType * __restrict__ A_values,    // A.values (MatPrec)
+    VecValueType * __restrict__ w)                 // vector to scale by D^{-1} (VecPrec)
+{
+    for (int dof = blockDim.x * blockIdx.x + threadIdx.x; dof < num_dofs; dof += gridDim.x * blockDim.x)
+    {
+        int node = dof / block_size;
+        int local = dof % block_size;
+        IndexType diag_nz = diag_offsets[node];
+        MatValueType diag_val = A_values[diag_nz * block_size * block_size + local * block_size + local];
+        if (!types::util<MatValueType>::is_zero(diag_val))
+        {
+            w[dof] = w[dof] / diag_val;
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// estimateSADampingFactor
+// ---------------------------------------------------------------
+//
+// Returns the SA damping factor omega = (4/3) / rho(D^{-1}A).
+// Uses power iteration to estimate rho(D^{-1}A): the spectral radius
+// of the Jacobi-preconditioned operator.  Starting from a vector of
+// ones, each iteration applies A then D^{-1} and tracks the Rayleigh
+// quotient.  Convergence is typically reached in 10-20 iterations.
+//
+// Note: PETSc GAMG uses omega = 4/(3*rho) by default (same formula).
+// The constant 4/3 ≈ 1.333 is the optimal damping for SA prolongator
+// smoothing on model problems (Baker et al., 2011).
+
+template <class T_Config>
+typename T_Config::VecPrec
+Aggregation_AMG_Level_Base<T_Config>::estimateSADampingFactor(int max_iter)
+{
+    Matrix<TConfig> &A = this->getA();
+    int block_size    = A.get_block_dimy();
+    int num_rows      = A.get_num_rows();
+    int num_dofs      = num_rows * block_size;
+
+    // Fallback: if matrix is empty or diagonal array not allocated, return 0.7 (= 1.4/2).
+    if (num_dofs == 0 || A.diag.size() == 0)
+    {
+        ValueTypeB omega_fb = types::util<ValueTypeB>::get_one();
+        typedef typename types::PODTypes<ValueTypeB>::type PodB_fb;
+        omega_fb = omega_fb * static_cast<PodB_fb>(0.7);
+        return omega_fb;
+    }
+
+    // Clamp iteration count.
+    if (max_iter <= 0) max_iter = 20;
+
+    // Allocate work vectors (DOF-level, block_dimy set for SpMV).
+    VVector w(num_dofs, types::util<ValueTypeB>::get_one());
+    VVector v(num_dofs, types::util<ValueTypeB>::get_zero());
+    w.set_block_dimy(block_size);
+    w.set_block_dimx(1);
+    v.set_block_dimy(block_size);
+    v.set_block_dimx(1);
+
+    const int threads = 256;
+    const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
+
+    typedef typename types::PODTypes<ValueTypeB>::type PodB;
+    ValueTypeB lambda = types::util<ValueTypeB>::get_one();
+
+    for (int iter = 0; iter < max_iter; ++iter)
+    {
+        // v = A * w  (SpMV, owned rows only)
+        thrust_wrapper::fill<TConfig::memSpace>(v.begin(), v.end(),
+                                                types::util<ValueTypeB>::get_zero());
+        multiply(A, w, v, OWNED);
+
+        // v = D^{-1} * v  (point diagonal scaling)
+        apply_point_dinv_kernel<<<blocks, threads>>>(
+            num_dofs, block_size,
+            A.diag.raw(),
+            A.values.raw(),
+            v.raw());
+        cudaCheckError();
+
+        // Rayleigh quotient: lambda = <w, v> / <w, w>
+        ValueTypeB wv = amgx::thrust::inner_product(
+            w.begin(), w.begin() + num_dofs,
+            v.begin(), types::util<ValueTypeB>::get_zero());
+        ValueTypeB ww = amgx::thrust::inner_product(
+            w.begin(), w.begin() + num_dofs,
+            w.begin(), types::util<ValueTypeB>::get_zero());
+        cudaCheckError();
+
+        if (!types::util<ValueTypeB>::is_zero(ww))
+            lambda = wv / ww;
+
+        // Normalize: w = v / ||v||
+        ValueTypeB vv = amgx::thrust::inner_product(
+            v.begin(), v.begin() + num_dofs,
+            v.begin(), types::util<ValueTypeB>::get_zero());
+        cudaCheckError();
+        PodB norm_v = std::sqrt(static_cast<PodB>(types::util<ValueTypeB>::abs(vv)));
+        if (norm_v > (PodB)0.0)
+        {
+            ValueTypeB inv_norm = types::util<ValueTypeB>::get_one();
+            // Scale inv_norm by 1/norm_v using POD arithmetic.
+            inv_norm = inv_norm * static_cast<PodB>(1.0 / norm_v);
+            amgx::thrust::transform(v.begin(), v.begin() + num_dofs,
+                                    w.begin(),
+                                    amgx::thrust::placeholders::_1 * inv_norm);
+            cudaCheckError();
+        }
+    }
+
+    // omega = (4/3) / rho(D^{-1}A)  -- classic SA prolongator smoothing factor
+    // (Baker et al., 2011).  PETSc GAMG uses the same formula with the same
+    // constant, so both solvers produce identical omega given the same rho.
+    PodB lambda_pod = static_cast<PodB>(types::util<ValueTypeB>::abs(lambda));
+    ValueTypeB omega = types::util<ValueTypeB>::get_one();
+    static const PodB omega_num = static_cast<PodB>(4.0 / 3.0);
+    if (lambda_pod > (PodB)0.0)
+    {
+        PodB omega_pod = omega_num / lambda_pod;
+        omega = omega * omega_pod;
+    }
+
+    return omega;
+}
+
+// ---------------------------------------------------------------
+// Kernel: expand block-CSR A (block_size > 1) to scalar CSR A_scalar.
+//
+// Each block-row i of A expands to block_size scalar rows.
+// Each block-nonzero (block column node_j) expands to block_size scalar
+// columns.  Scalar row (i*bs + li) has (row_offsets[i+1]-row_offsets[i])*bs
+// entries.  A_scalar_row_offsets must already be the exclusive-scan result
+// (computed by build_SA_smoother_block_rowlen_kernel + exclusive_scan).
+//
+// Scalar value at position (i*bs+li, node_j*bs+lj) is
+//   A_values[bnz * bs * bs + li * bs + lj]
+// ---------------------------------------------------------------
+template <typename IndexType, typename ValueType>
+__global__
+void expand_block_to_scalar_kernel(
+    int num_block_rows,
+    int block_size,
+    const IndexType * __restrict__ A_row_offsets,
+    const IndexType * __restrict__ A_col_indices,
+    const ValueType * __restrict__ A_values,
+    const IndexType * __restrict__ As_row_offsets,   // exclusive-scan result
+    IndexType       * __restrict__ As_col_indices,
+    ValueType       * __restrict__ As_values)
+{
+    int num_dofs = num_block_rows * block_size;
+    for (int dof = blockDim.x * blockIdx.x + threadIdx.x;
+         dof < num_dofs;
+         dof += gridDim.x * blockDim.x)
+    {
+        int node = dof / block_size;
+        int li   = dof % block_size;
+
+        int s_pos   = As_row_offsets[dof];
+        int a_start = A_row_offsets[node];
+        int a_end   = A_row_offsets[node + 1];
+
+        for (int bnz = a_start; bnz < a_end; ++bnz)
+        {
+            int node_j = A_col_indices[bnz];
+            for (int lj = 0; lj < block_size; ++lj)
+            {
+                As_col_indices[s_pos] = node_j * block_size + lj;
+                As_values[s_pos]      = A_values[bnz * block_size * block_size
+                                                  + li * block_size + lj];
+                ++s_pos;
+            }
+        }
+    }
+}
+
+// Wrapper to avoid CUDA template-argument-in-<<<>>> parse issue.
+// CUDA's <<<>>> syntax cannot handle comma-separated template args directly.
+template <typename IndexType, typename ValueType>
+void launch_expand_block_to_scalar(
+    int num_block_rows, int block_size, int num_dofs,
+    const IndexType *A_row_offsets, const IndexType *A_col_indices,
+    const ValueType *A_values,
+    const IndexType *As_row_offsets,
+    IndexType *As_col_indices, ValueType *As_values)
+{
+    typedef void (*KernPtr)(int, int,
+                            const IndexType*, const IndexType*, const ValueType*,
+                            const IndexType*, IndexType*, ValueType*);
+    KernPtr kptr = expand_block_to_scalar_kernel<IndexType, ValueType>;
+    const int threads = 256;
+    const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
+    kptr<<<blocks, threads>>>(
+        num_block_rows, block_size,
+        A_row_offsets, A_col_indices, A_values,
+        As_row_offsets, As_col_indices, As_values);
+}
+
+// ---------------------------------------------------------------
+// Kernel: build S = I - omega * D^{-1} * A  (scalar CSR, block_size==1)
+// ---------------------------------------------------------------
+template <typename IndexType, typename ValueType, typename PodType>
+__global__
+void build_SA_smoother_kernel(
+    int num_rows,
+    PodType omega,
+    const IndexType * __restrict__ row_offsets,
+    const IndexType * __restrict__ col_indices,
+    const ValueType * __restrict__ A_values,
+    const IndexType * __restrict__ A_diag,
+    ValueType * __restrict__ S_values)
+{
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x;
+         i < num_rows;
+         i += gridDim.x * blockDim.x)
+    {
+        // Get diagonal value
+        IndexType diag_nz = A_diag[i];
+        ValueType d_ii = A_values[diag_nz];
+        ValueType inv_d = types::util<ValueType>::is_zero(d_ii)
+                          ? types::util<ValueType>::get_zero()
+                          : types::util<ValueType>::get_one() / d_ii;
+
+        int row_start = row_offsets[i];
+        int row_end   = row_offsets[i + 1];
+
+        // Convert omega (PodType = real scalar) to ValueType for mixed arithmetic
+        ValueType omega_v = types::util<ValueType>::get_one();
+        omega_v = omega_v * omega;  // works for both real and complex
+
+        for (int nz = row_start; nz < row_end; ++nz)
+        {
+            int j = col_indices[nz];
+            ValueType a_ij = A_values[nz];
+            // S[i,j] = delta(i,j) - omega * a_ij / d_ii
+            ValueType s_ij = types::util<ValueType>::get_zero() - omega_v * inv_d * a_ij;
+            if (j == i)
+                s_ij = s_ij + types::util<ValueType>::get_one();
+            S_values[nz] = s_ij;
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// Kernel: build scalar S row offsets from block-CSR A (block_size > 1)
+//
+// Each block-row i of A (with block_size x block_size blocks) expands
+// to block_size scalar rows.  Each block-nonzero expands to block_size
+// scalar columns.  So scalar row (i*bs + li) has
+//   (row_offsets[i+1] - row_offsets[i]) * block_size  entries.
+//
+// This kernel fills S_row_offsets[0..num_dofs] (exclusive scan input):
+//   S_row_offsets[i*bs + li] = (row_offsets[i+1]-row_offsets[i]) * bs
+// Then an exclusive scan converts it to actual offsets.
+// ---------------------------------------------------------------
+template <typename IndexType>
+__global__
+void build_SA_smoother_block_rowlen_kernel(
+    int num_block_rows,
+    int block_size,
+    const IndexType * __restrict__ A_row_offsets,
+    IndexType * __restrict__ S_row_offsets)   // length num_dofs+1, pre-zeroed
+{
+    int num_dofs = num_block_rows * block_size;
+    for (int dof = blockDim.x * blockIdx.x + threadIdx.x;
+         dof < num_dofs;
+         dof += gridDim.x * blockDim.x)
+    {
+        int node = dof / block_size;
+        int row_len = A_row_offsets[node + 1] - A_row_offsets[node];
+        S_row_offsets[dof] = row_len * block_size;
+    }
+    // Sentinel: last entry set to 0 (will be filled by exclusive_scan)
+    if (blockDim.x * blockIdx.x + threadIdx.x == 0)
+        S_row_offsets[num_dofs] = 0;
+}
+
+// ---------------------------------------------------------------
+// Kernel: fill scalar S col_indices and values from block-CSR A
+//
+// For scalar row dof = node*bs + li:
+//   The block-nonzeros of A for block-row `node` are at
+//   A_row_offsets[node] .. A_row_offsets[node+1]-1.
+//   For each block-nz at position `bnz` (block column `node_j = A_col_indices[bnz]`):
+//     scalar columns: node_j*bs + lj  for lj in [0, bs)
+//     scalar value:   A_values[bnz*bs*bs + li*bs + lj]
+//     S value:        delta(dof, node_j*bs+lj) - omega * inv_d_li * a_ij
+//   where inv_d_li = 1 / A_values[A_diag[node]*bs*bs + li*bs + li]
+//
+// S_row_offsets must already be the exclusive-scan result.
+// ---------------------------------------------------------------
+template <typename IndexType, typename ValueType, typename PodType>
+__global__
+void build_SA_smoother_block_kernel(
+    int num_block_rows,
+    int block_size,
+    PodType omega,
+    const IndexType * __restrict__ A_row_offsets,
+    const IndexType * __restrict__ A_col_indices,
+    const ValueType * __restrict__ A_values,
+    const IndexType * __restrict__ A_diag,
+    const IndexType * __restrict__ S_row_offsets,
+    IndexType * __restrict__ S_col_indices,
+    ValueType * __restrict__ S_values)
+{
+    int num_dofs = num_block_rows * block_size;
+    ValueType omega_v = types::util<ValueType>::get_one();
+    omega_v = omega_v * omega;
+
+    for (int dof = blockDim.x * blockIdx.x + threadIdx.x;
+         dof < num_dofs;
+         dof += gridDim.x * blockDim.x)
+    {
+        int node = dof / block_size;
+        int li   = dof % block_size;
+
+        // Point diagonal: A[node,node][li,li]
+        IndexType diag_bnz = A_diag[node];
+        ValueType d_li = A_values[diag_bnz * block_size * block_size + li * block_size + li];
+        ValueType inv_d = types::util<ValueType>::is_zero(d_li)
+                          ? types::util<ValueType>::get_zero()
+                          : types::util<ValueType>::get_one() / d_li;
+
+        int s_pos = S_row_offsets[dof];  // write position in S arrays
+
+        int a_start = A_row_offsets[node];
+        int a_end   = A_row_offsets[node + 1];
+
+        for (int bnz = a_start; bnz < a_end; ++bnz)
+        {
+            int node_j = A_col_indices[bnz];
+            for (int lj = 0; lj < block_size; ++lj)
+            {
+                int col_dof = node_j * block_size + lj;
+                ValueType a_ij = A_values[bnz * block_size * block_size + li * block_size + lj];
+                ValueType s_ij = types::util<ValueType>::get_zero() - omega_v * inv_d * a_ij;
+                if (col_dof == dof)
+                    s_ij = s_ij + types::util<ValueType>::get_one();
+                S_col_indices[s_pos] = col_dof;
+                S_values[s_pos]      = s_ij;
+                ++s_pos;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// smoothProlongator
+// ---------------------------------------------------------------
+//
+// Smooths the tentative prolongator m_P_tent using full SpGEMM:
+//   P_smooth = S * P_tent,  where S = I - omega * D^{-1} * A
+//
+// For block_size == 1: S has the same sparsity as A (scalar CSR).
+// For block_size > 1:  S is the scalar expansion of the block-CSR A.
+//   Each block-row i expands to block_size scalar rows; each block-nz
+//   expands to block_size scalar columns.
+//
+// The SpGEMM produces P_smooth with a LARGER sparsity pattern than
+// P_tent (fine-node neighbours of each aggregate can contribute new
+// column entries).  After this call, m_P_tent is replaced wholesale
+// by P_smooth — including its new, larger row_offsets and col_indices.
+
+template <class T_Config>
+void Aggregation_AMG_Level_Base<T_Config>::smoothProlongator()
+{
+    if (m_null_dim <= 0 || m_P_tent.get_num_rows() == 0)
+        FatalError("smoothProlongator: P_tent not built", AMGX_ERR_BAD_PARAMETERS);
+
+    Matrix<TConfig> &A = this->getA();
+    int block_size     = A.get_block_dimy();
+    int num_rows       = A.get_num_rows();   // node-level rows
+    int num_dofs       = num_rows * block_size;
+
+    // Estimate damping factor omega = (4/3) / rho(D^{-1}A)
+    ValueTypeB omega_b = estimateSADampingFactor();
+    typedef typename types::PODTypes<ValueTypeB>::type PodB;
+    PodB omega_pod = types::util<ValueTypeB>::abs(omega_b);
+
+    // Store rho(D^{-1}A) for use by the Chebyshev smoother (lambda_mode=4).
+    // estimateSADampingFactor returns omega = (4/3) / rho, so rho = (4/3) / omega.
+    static const double omega_num_d = 4.0 / 3.0;
+    if (omega_pod > (PodB)0.0)
+        m_sa_rho = omega_num_d / static_cast<double>(omega_pod);
+    else
+        m_sa_rho = 0.0;
+
+    // Per-level SA eigen estimate summary (one line per level, always printed).
+    fprintf(stderr, "[SA-EIGEN] level=%d  rho(D^{-1}A)=%.6e  omega=(4/3)/rho=%.6e"
+            "  dofs=%d  block=%d\n",
+            this->getLevelIndex(), m_sa_rho, (double)omega_pod, num_dofs, block_size);
+
+    // ---------------------------------------------------------------
+    // Build S = I - omega * D^{-1} * A  as an explicit scalar CSR matrix.
+    // ---------------------------------------------------------------
+    Matrix<TConfig> S;
+    S.set_initialized(0);
+    S.addProps(CSR);
+
+    if (block_size == 1)
+    {
+        // S has the same sparsity as A (scalar CSR, 1x1 blocks)
+        int S_nnz = A.get_num_nz();
+        S.resize(num_rows, num_rows, S_nnz, 1, 1, 1);
+
+        // Copy A's sparsity pattern to S
+        thrust_wrapper::copy<TConfig::memSpace>(
+            A.row_offsets.begin(), A.row_offsets.begin() + num_rows + 1,
+            S.row_offsets.begin());
+        thrust_wrapper::copy<TConfig::memSpace>(
+            A.col_indices.begin(), A.col_indices.begin() + S_nnz,
+            S.col_indices.begin());
+        cudaCheckError();
+
+        // Compute S values: S[i,j] = delta(i,j) - omega * A[i,j] / A[i,i]
+        {
+            const int threads = 256;
+            const int blocks  = std::min(4096, (num_rows + threads - 1) / threads);
+            build_SA_smoother_kernel<<<blocks, threads>>>(
+                num_rows,
+                omega_pod,
+                A.row_offsets.raw(),
+                A.col_indices.raw(),
+                A.values.raw(),
+                A.diag.raw(),
+                S.values.raw());
+            cudaCheckError();
+        }
+    }
+    else
+    {
+        // block_size > 1: expand block-CSR A to scalar CSR S.
+        // S is num_dofs x num_dofs with S_nnz = A_block_nnz * block_size^2.
+        int A_block_nnz = A.get_num_nz();
+        long long S_nnz_ll = (long long)A_block_nnz * block_size * block_size;
+        fprintf(stderr, "[SA-SNNZ] level=%d  A_block_nnz=%d  block_size=%d  "
+                "S_nnz=%lld  num_dofs=%d\n",
+                this->getLevelIndex(), A_block_nnz, block_size,
+                S_nnz_ll, num_dofs);
+        fflush(stderr);
+        if (S_nnz_ll > (long long)INT_MAX)
+        {
+            fprintf(stderr, "[SA-SNNZ] ERROR: S_nnz overflows int32! "
+                    "S_nnz=%lld > INT_MAX=%d\n", S_nnz_ll, INT_MAX);
+            fflush(stderr);
+            FatalError("smoothProlongator: S_nnz overflows int32", AMGX_ERR_BAD_PARAMETERS);
+        }
+        int S_nnz = (int)S_nnz_ll;
+        fprintf(stderr, "[SA-KERN] level=%d  before S.resize(%d,%d,%d,1,1,1)\n",
+                this->getLevelIndex(), num_dofs, num_dofs, S_nnz);
+        fflush(stderr);
+        S.resize(num_dofs, num_dofs, S_nnz, 1, 1, 1);
+        fprintf(stderr, "[SA-KERN] level=%d  after S.resize  S.row_offsets.size=%d\n",
+                this->getLevelIndex(), (int)S.row_offsets.size());
+        fflush(stderr);
+
+        // Step 1: compute per-scalar-row lengths, then exclusive scan -> S_row_offsets
+        {
+            const int threads = 256;
+            const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
+            thrust_wrapper::fill<TConfig::memSpace>(
+                S.row_offsets.begin(), S.row_offsets.end(),
+                (IndexType)0);
+            fprintf(stderr, "[SA-KERN] level=%d  after thrust fill  launching rowlen_kernel blocks=%d threads=%d\n",
+                    this->getLevelIndex(), blocks, threads);
+            fflush(stderr);
+            build_SA_smoother_block_rowlen_kernel<IndexType><<<blocks, threads>>>(
+                num_rows, block_size,
+                A.row_offsets.raw(),
+                S.row_offsets.raw());
+            cudaError_t err1 = cudaDeviceSynchronize();
+            fprintf(stderr, "[SA-KERN] level=%d  rowlen_kernel done: err=%d (%s)\n",
+                    this->getLevelIndex(), (int)err1, cudaGetErrorString(err1));
+            if (err1 != cudaSuccess)
+                FatalError("build_SA_smoother_block_rowlen_kernel failed", AMGX_ERR_CUDA_FAILURE);
+        }
+        thrust_wrapper::exclusive_scan<TConfig::memSpace>(
+            S.row_offsets.begin(), S.row_offsets.end(),
+            S.row_offsets.begin());
+        {
+            cudaError_t err2 = cudaDeviceSynchronize();
+            fprintf(stderr, "[SA-KERN] level=%d  exclusive_scan done: err=%d (%s)\n",
+                    this->getLevelIndex(), (int)err2, cudaGetErrorString(err2));
+            if (err2 != cudaSuccess)
+                FatalError("exclusive_scan failed", AMGX_ERR_CUDA_FAILURE);
+        }
+
+        // Step 2: fill col_indices and values
+        // A.values and S.values are ValueTypeA (MatPrec), so use that type.
+        {
+            typedef ValueTypeA MatValueType;
+            typedef typename types::PODTypes<MatValueType>::type PodA;
+            PodA omega_pod_a = static_cast<PodA>(omega_pod);
+            const int threads = 256;
+            const int blocks  = std::min(4096, (num_dofs + threads - 1) / threads);
+            build_SA_smoother_block_kernel<IndexType, MatValueType, PodA><<<blocks, threads>>>(
+                num_rows, block_size,
+                omega_pod_a,
+                A.row_offsets.raw(),
+                A.col_indices.raw(),
+                A.values.raw(),
+                A.diag.raw(),
+                S.row_offsets.raw(),
+                S.col_indices.raw(),
+                S.values.raw());
+            cudaError_t err3 = cudaDeviceSynchronize();
+            fprintf(stderr, "[SA-KERN] level=%d  block_kernel done: err=%d (%s)\n",
+                    this->getLevelIndex(), (int)err3, cudaGetErrorString(err3));
+            if (err3 != cudaSuccess)
+                FatalError("build_SA_smoother_block_kernel failed", AMGX_ERR_CUDA_FAILURE);
+        }
+
+        // Diagnostic: min/max of point diagonal d_li = A[node,node][li,li]
+        // used for damping in build_SA_smoother_block_kernel.
+        // Near-zero d_li → inv_d blows up → S has huge entries → P_smooth ill-conditioned.
+        {
+            typedef ValueTypeA MatValueType;
+            typedef typename types::PODTypes<MatValueType>::type PodA;
+            int A_block_nnz2 = A.get_num_nz();
+            // A.values stores block_size*block_size scalars per block-NNZ entry
+            int A_scalar_nnz = A_block_nnz2 * block_size * block_size;
+            std::vector<MatValueType> A_vals_h(A_scalar_nnz);
+            std::vector<int> A_diag_h(num_rows);
+            cudaMemcpy(A_vals_h.data(), A.values.raw(),
+                       A_scalar_nnz * sizeof(MatValueType), cudaMemcpyDeviceToHost);
+            cudaMemcpy(A_diag_h.data(), A.diag.raw(),
+                       num_rows * sizeof(int), cudaMemcpyDeviceToHost);
+            double min_d = 1e300, max_d = 0.0;
+            int n_zero_d = 0, n_neg_d = 0;
+            for (int node = 0; node < num_rows; ++node)
+            {
+                int diag_bnz = A_diag_h[node];
+                for (int li = 0; li < block_size; ++li)
+                {
+                    int idx = diag_bnz * block_size * block_size + li * block_size + li;
+                    MatValueType d_raw = A_vals_h[idx];
+                    PodA d_signed;
+                    memcpy(&d_signed, &d_raw, sizeof(PodA));
+                    double d = std::abs((double)d_signed);
+                    if ((double)d_signed < 0.0) n_neg_d++;
+                    if (d < 1e-14) n_zero_d++;
+                    if (d < min_d) min_d = d;
+                    if (d > max_d) max_d = d;
+                }
+            }
+            fprintf(stderr, "[SA-DIAG] level=%d  block=%d  num_dofs=%d  "
+                    "min_point_diag=%.4e  max_point_diag=%.4e  "
+                    "n_near_zero(|d|<1e-14)=%d  n_negative=%d\n",
+                    this->getLevelIndex(), block_size, num_dofs,
+                    min_d, max_d, n_zero_d, n_neg_d);
+            fflush(stderr);
+        }
+    }
+
+    S.set_initialized(1);
+
+    // ---------------------------------------------------------------
+    // Compute P_smooth = S * P_tent via SpGEMM
+    // ---------------------------------------------------------------
+    Matrix<TConfig> P_smooth;
+    CSR_Multiply<TConfig>::csr_multiply(S, m_P_tent, P_smooth, NULL);
+
+    // DEBUG NaN diagnostic: check P_smooth, S, P_tent for NaN/Inf after SpGEMM
+    {
+        typedef ValueTypeA MVal;
+        typedef typename types::PODTypes<MVal>::type PodM;
+        auto check_nan_inf = [](const MVal *d_ptr, int count, const char *label) {
+            if (count <= 0) return;
+            std::vector<MVal> vals_h(count);
+            cudaMemcpy(vals_h.data(), d_ptr, count * sizeof(MVal), cudaMemcpyDeviceToHost);
+            int nan_cnt = 0, inf_cnt = 0;
+            for (int i = 0; i < count; ++i)
+            {
+                PodM v = static_cast<PodM>(types::util<MVal>::abs(vals_h[i]));
+                if (std::isnan((double)v)) nan_cnt++;
+                if (std::isinf((double)v)) inf_cnt++;
+            }
+            fprintf(stderr, "[DEBUG smoothProlongator] %s: count=%d NaN=%d Inf=%d\n",
+                    label, count, nan_cnt, inf_cnt);
+        };
+        check_nan_inf(P_smooth.values.raw(), P_smooth.get_num_nz(), "P_smooth");
+        fprintf(stderr, "[DEBUG smoothProlongator] P_smooth: rows=%d cols=%d nnz=%d\n",
+                P_smooth.get_num_rows(), P_smooth.get_num_cols(), P_smooth.get_num_nz());
+        // Column norms of P_smooth
+        {
+            int nrows = P_smooth.get_num_rows();
+            int ncols = P_smooth.get_num_cols();
+            int nnz   = P_smooth.get_num_nz();
+            std::vector<MVal> pv(nnz);
+            std::vector<int>  pr(nrows + 1), pc(nnz);
+            cudaMemcpy(pv.data(), P_smooth.values.raw(),      nnz   * sizeof(MVal), cudaMemcpyDeviceToHost);
+            cudaMemcpy(pr.data(), P_smooth.row_offsets.raw(), (nrows+1)*sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(pc.data(), P_smooth.col_indices.raw(), nnz   * sizeof(int),  cudaMemcpyDeviceToHost);
+            std::vector<double> col_norm2(ncols, 0.0);
+            double min_val = 1e300, max_val = 0.0;
+            for (int i = 0; i < nnz; ++i)
+            {
+                double v = (double)static_cast<PodM>(types::util<MVal>::abs(pv[i]));
+                col_norm2[pc[i]] += v * v;
+                if (v < min_val) min_val = v;
+                if (v > max_val) max_val = v;
+            }
+            double min_cn = 1e300, max_cn = 0.0;
+            int ps_zero_cols = 0;
+            for (int c = 0; c < ncols; ++c)
+            {
+                double cn = sqrt(col_norm2[c]);
+                if (cn < min_cn) min_cn = cn;
+                if (cn > max_cn) max_cn = cn;
+                if (cn < 1e-14) ps_zero_cols++;
+            }
+            fprintf(stderr, "[DEBUG smoothProlongator] P_smooth: min_entry=%.4e max_entry=%.4e "
+                    "min_col_norm=%.4e max_col_norm=%.4e zero_cols=%d\n",
+                    min_val, max_val, min_cn, max_cn, ps_zero_cols);
+            if (ps_zero_cols > 0 && ps_zero_cols <= 20)
+            {
+                for (int c = 0; c < ncols; ++c)
+                    if (sqrt(col_norm2[c]) < 1e-14)
+                        fprintf(stderr, "[DEBUG smoothProlongator]   P_smooth zero-col %d (agg=%d, k=%d)\n",
+                                c, c / m_null_dim, c % m_null_dim);
+            }
+        }
+        // Column norms of P_tent (before smoothing, stored in m_P_tent)
+        {
+            int nrows = m_P_tent.get_num_rows();
+            int ncols = m_P_tent.get_num_cols();
+            int nnz   = m_P_tent.get_num_nz();
+            std::vector<MVal> pv(nnz);
+            std::vector<int>  pt_r(nrows + 1), pt_c(nnz);
+            cudaMemcpy(pv.data(), m_P_tent.values.raw(), nnz * sizeof(MVal), cudaMemcpyDeviceToHost);
+            cudaMemcpy(pt_r.data(), m_P_tent.row_offsets.raw(), (nrows+1)*sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(pt_c.data(), m_P_tent.col_indices.raw(), nnz * sizeof(int), cudaMemcpyDeviceToHost);
+            double min_val = 1e300, max_val = 0.0;
+            std::vector<double> pt_col_norm2(ncols, 0.0);
+            for (int row = 0; row < nrows; ++row)
+            {
+                for (int j = pt_r[row]; j < pt_r[row+1]; ++j)
+                {
+                    double v = (double)static_cast<PodM>(types::util<MVal>::abs(pv[j]));
+                    if (v < min_val) min_val = v;
+                    if (v > max_val) max_val = v;
+                    pt_col_norm2[pt_c[j]] += v * v;
+                }
+            }
+            double pt_min_cn = 1e300, pt_max_cn = 0.0;
+            int pt_zero_cols = 0;
+            for (int c = 0; c < ncols; ++c)
+            {
+                double cn = sqrt(pt_col_norm2[c]);
+                if (cn < pt_min_cn) pt_min_cn = cn;
+                if (cn > pt_max_cn) pt_max_cn = cn;
+                if (cn < 1e-14) pt_zero_cols++;
+            }
+            fprintf(stderr, "[DEBUG smoothProlongator] P_tent: rows=%d cols=%d nnz=%d "
+                    "min_entry=%.4e max_entry=%.4e min_col_norm=%.4e max_col_norm=%.4e zero_cols=%d\n",
+                    nrows, ncols, nnz, min_val, max_val, pt_min_cn, pt_max_cn, pt_zero_cols);
+            if (pt_zero_cols > 0 && pt_zero_cols <= 20)
+            {
+                for (int c = 0; c < ncols; ++c)
+                    if (sqrt(pt_col_norm2[c]) < 1e-14)
+                        fprintf(stderr, "[DEBUG smoothProlongator]   P_tent zero-col %d (agg=%d, k=%d)\n",
+                                c, c / m_null_dim, c % m_null_dim);
+            }
+        }
+        check_nan_inf(S.values.raw(), S.get_num_nz(), "S");
+        check_nan_inf(m_P_tent.values.raw(), m_P_tent.get_num_nz(), "P_tent(input)");
+
+        // Zero-row diagnostics: count zero rows in P_tent and P_smooth.
+        // For Approach A (singletons removed from coarse grid), P_tent has
+        // zero-nnz rows for singleton DOFs.  After SpGEMM, P_smooth should
+        // have NO zero rows (SA smoother fills them from algebraic neighbors).
+        {
+            // P_tent zero rows (structural zeros = zero nnz)
+            int nrows_pt = m_P_tent.get_num_rows();
+            std::vector<int> pt_ro(nrows_pt + 1);
+            cudaMemcpy(pt_ro.data(), m_P_tent.row_offsets.raw(),
+                       (nrows_pt + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+            int pt_zero_rows = 0;
+            for (int r = 0; r < nrows_pt; ++r)
+                if (pt_ro[r+1] == pt_ro[r]) pt_zero_rows++;
+            fprintf(stderr, "[DEBUG smoothProlongator] P_tent zero-nnz rows: %d / %d\n",
+                    pt_zero_rows, nrows_pt);
+
+            // P_smooth zero rows (structural zeros = zero nnz)
+            int nrows_ps = P_smooth.get_num_rows();
+            int nnz_ps   = P_smooth.get_num_nz();
+            std::vector<int> ps_ro(nrows_ps + 1);
+            std::vector<int> ps_ci(nnz_ps);
+            std::vector<MVal> ps_v(nnz_ps);
+            cudaMemcpy(ps_ro.data(), P_smooth.row_offsets.raw(),
+                       (nrows_ps + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+            if (nnz_ps > 0) {
+                cudaMemcpy(ps_ci.data(), P_smooth.col_indices.raw(),
+                           nnz_ps * sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(ps_v.data(), P_smooth.values.raw(),
+                           nnz_ps * sizeof(MVal), cudaMemcpyDeviceToHost);
+            }
+            int ps_zero_rows = 0;
+            int ps_zero_rows_printed = 0;
+            for (int r = 0; r < nrows_ps; ++r)
+            {
+                bool row_zero = true;
+                for (int j = ps_ro[r]; j < ps_ro[r+1]; ++j)
+                {
+                    double v = (double)static_cast<PodM>(
+                        types::util<MVal>::abs(ps_v[j]));
+                    if (v > 1e-300) { row_zero = false; break; }
+                }
+                if (row_zero)
+                {
+                    ps_zero_rows++;
+                    if (ps_zero_rows_printed < 10)
+                    {
+                        fprintf(stderr,
+                            "[DEBUG smoothProlongator]   P_smooth zero row %d "
+                            "(nnz=%d)\n", r, ps_ro[r+1] - ps_ro[r]);
+                        ps_zero_rows_printed++;
+                    }
+                }
+            }
+            fprintf(stderr, "[DEBUG smoothProlongator] P_smooth zero rows: %d / %d\n",
+                    ps_zero_rows, nrows_ps);
+        }
+    }
+
+    // Replace m_P_tent with the smoothed prolongator
+    m_P_tent.swap(P_smooth);
+}
+
+// -------------------------------------------------------------
 // Explicit instantiations
 // -------------------------------------------------------------
 
 #define AMGX_CASE_LINE(CASE) template class Aggregation_AMG_Level<TemplateMode<CASE>::Type>;
 AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
 AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+// Explicit instantiations for setNearNullSpace (base class method)
+#define AMGX_CASE_LINE(CASE) \
+    template void Aggregation_AMG_Level_Base<TemplateMode<CASE>::Type>::setNearNullSpace( \
+        int, int, const double *);
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+// Explicit instantiations for buildTentativeProlongator (base class method)
+#define AMGX_CASE_LINE(CASE) \
+    template void Aggregation_AMG_Level_Base<TemplateMode<CASE>::Type>::buildTentativeProlongator();
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+// Explicit instantiations for estimateSADampingFactor (base class method)
+#define AMGX_CASE_LINE(CASE) \
+    template typename TemplateMode<CASE>::Type::VecPrec \
+    Aggregation_AMG_Level_Base<TemplateMode<CASE>::Type>::estimateSADampingFactor(int);
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+// -----------------------------------------------------------------------
+// createBlockGraph
+//
+// Compress a scalar (block_dimy=1) Galerkin product Ac into a block matrix
+// with block_dim x block_dim blocks, analogous to PETSc's PCGAMGCreateGraph_AGG.
+//
+// The coarse Ac block size equals the column block size of P, which is
+// m_null_dim (the number of near-null vectors provided by the user).
+//
+// Scalar entry (r, c) maps to block entry (r/block_dim, c/block_dim) at
+// local position (r%block_dim, c%block_dim).  Block values are stored
+// row-major within each block:
+//   values[blk_nnz * block_dim*block_dim + local_row * block_dim + local_col]
+//
+// Precondition:  Ac.get_block_dimy() == 1,
+//                Ac.get_num_rows() % block_dim == 0
+// Postcondition: Ac.get_block_dimy() == block_dim,
+//                Ac.get_num_rows()   == old_num_rows / block_dim
+// -----------------------------------------------------------------------
+template <class T_Config>
+void Aggregation_AMG_Level_Base<T_Config>::createBlockGraph(
+    Matrix<TConfig> &Ac, int block_dim)
+{
+    typedef ValueTypeA MVal;
+    const int nd       = block_dim;
+    const int nd2      = nd * nd;
+    int As_rows        = Ac.get_num_rows();   // = num_aggs * nd
+    int As_nnz         = Ac.get_num_nz();
+    int num_aggs_local = As_rows / nd;        // = num_aggs
+
+    // Download scalar Ac from device
+    std::vector<MVal> As_vals(As_nnz);
+    std::vector<int>  As_row(As_rows + 1), As_col(As_nnz);
+    cudaMemcpy(As_vals.data(), Ac.values.raw(),
+               As_nnz * sizeof(MVal), cudaMemcpyDeviceToHost);
+    cudaMemcpy(As_row.data(), Ac.row_offsets.raw(),
+               (As_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(As_col.data(), Ac.col_indices.raw(),
+               As_nnz * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Pass 1: collect unique block columns per block row using sorted sets
+    std::vector<std::set<int>> block_cols(num_aggs_local);
+    for (int sr = 0; sr < As_rows; ++sr)
+    {
+        int bi = sr / nd;
+        for (int j = As_row[sr]; j < As_row[sr + 1]; ++j)
+            block_cols[bi].insert(As_col[j] / nd);
+    }
+
+    // Build block row offsets
+    std::vector<int> Ab_row(num_aggs_local + 1, 0);
+    for (int bi = 0; bi < num_aggs_local; ++bi)
+        Ab_row[bi + 1] = Ab_row[bi] + (int)block_cols[bi].size();
+    int Ab_nnz = Ab_row[num_aggs_local];
+
+    // Build block column indices and zero-initialise block values
+    std::vector<int>  Ab_col(Ab_nnz);
+    std::vector<MVal> Ab_vals(Ab_nnz * nd2, types::util<MVal>::get_zero());
+    for (int bi = 0; bi < num_aggs_local; ++bi)
+    {
+        int pos = Ab_row[bi];
+        for (int bj : block_cols[bi])
+            Ab_col[pos++] = bj;
+    }
+
+    // Pass 2: scatter scalar values into block values (row-major layout)
+    for (int sr = 0; sr < As_rows; ++sr)
+    {
+        int bi = sr / nd, li = sr % nd;
+        for (int j = As_row[sr]; j < As_row[sr + 1]; ++j)
+        {
+            int bj = As_col[j] / nd, lj = As_col[j] % nd;
+            // Binary search for bj in Ab_col[Ab_row[bi]..Ab_row[bi+1])
+            int lo = Ab_row[bi], hi = Ab_row[bi + 1] - 1, blk_pos = -1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                if      (Ab_col[mid] == bj) { blk_pos = mid; break; }
+                else if (Ab_col[mid] <  bj)   lo = mid + 1;
+                else                           hi = mid - 1;
+            }
+            Ab_vals[blk_pos * nd2 + li * nd + lj] = As_vals[j];
+        }
+    }
+
+    // Rebuild Ac as a block matrix on the device
+    Ac.set_initialized(0);
+    Ac.resize(num_aggs_local, num_aggs_local, Ab_nnz, nd, nd, 0);
+    cudaMemcpy(Ac.row_offsets.raw(), Ab_row.data(),
+               (num_aggs_local + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(Ac.col_indices.raw(), Ab_col.data(),
+               Ab_nnz * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(Ac.values.raw(), Ab_vals.data(),
+               Ab_nnz * nd2 * sizeof(MVal), cudaMemcpyHostToDevice);
+
+    // Rebuild diagonal index array
+    Ac.diag.resize(num_aggs_local);
+    {
+        std::vector<int> diag_h(num_aggs_local, -1);
+        for (int bi = 0; bi < num_aggs_local; ++bi)
+            for (int j = Ab_row[bi]; j < Ab_row[bi + 1]; ++j)
+                if (Ab_col[j] == bi) { diag_h[bi] = j; break; }
+        cudaMemcpy(Ac.diag.raw(), diag_h.data(),
+                   num_aggs_local * sizeof(int), cudaMemcpyHostToDevice);
+    }
+    Ac.set_initialized(1);
+
+    fprintf(stderr,
+            "[SA-BLOCK] createBlockGraph: scalar Ac (%d×%d, nnz=%d) → "
+            "block-%d Ac (%d×%d, block_nnz=%d)\n",
+            As_rows, As_rows, As_nnz,
+            nd, num_aggs_local, num_aggs_local, Ab_nnz);
+}
+
+// Explicit instantiations for smoothProlongator (base class method)
+#define AMGX_CASE_LINE(CASE) \
+    template void Aggregation_AMG_Level_Base<TemplateMode<CASE>::Type>::smoothProlongator();
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
+#undef AMGX_CASE_LINE
+
+// Explicit instantiations for createBlockGraph (base class method)
+#define AMGX_CASE_LINE(CASE) \
+    template void Aggregation_AMG_Level_Base<TemplateMode<CASE>::Type>::createBlockGraph( \
+        Matrix<TemplateMode<CASE>::Type> &, int);
+AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
 #undef AMGX_CASE_LINE
 }
 

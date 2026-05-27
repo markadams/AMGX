@@ -48,6 +48,15 @@ class AlgebraicMultigrid_Solver: public Solver<T_Config>
 
         void SetThreadManager(ThreadManager *tmng) { m_amg.tmng = tmng; }
 
+        // Read-only access to the AMG hierarchy (for inspection / testing).
+        const AMG<vecPrec, matPrec, indPrec>& getAMG() const { return m_amg; }
+
+        // Forward near-null space data to the AMG object for Smoothed Aggregation.
+        void setNearNullSpace(int null_dim, int num_rows, const std::vector<double> &data) override
+        {
+            m_amg.setSANearNullSpace(null_dim, num_rows, data);
+        }
+
         // Destructor
         ~AlgebraicMultigrid_Solver();
 

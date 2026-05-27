@@ -65,6 +65,14 @@ ENDIF(NOT CMAKE_BUILD_TYPE)
 
 find_package(CUDAToolkit 12.0 REQUIRED)
 
+# Declare the cuDSS option before any if(AMGX_USE_CUDSS) checks.
+option(AMGX_USE_CUDSS "Enable cuDSS coarse-grid solver" OFF)
+
+if(AMGX_USE_CUDSS)
+    add_compile_definitions(AMGX_USE_CUDSS)
+    message(STATUS "cuDSS plugin enabled; will configure in external/cudss/")
+endif()
+
 # CUDA 13.1+ requires C++17 for Thrust and CUDA C++ Core Libraries
 if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1")
   message(STATUS "CUDA ${CUDAToolkit_VERSION} detected, setting C++17 standard")
@@ -263,6 +271,12 @@ ELSE (WIN32)
   target_link_libraries(amgx CUDA::cublas CUDA::cusparse CUDA::cusolver m pthread)
   target_link_libraries(amgxsh CUDA::cublas CUDA::cusparse CUDA::cusolver m pthread)
 ENDIF(WIN32)
+
+if(AMGX_USE_CUDSS)
+    # The plugin CMakeLists handles find_package(cudss), adds sources,
+    # sets include dirs, and links cuDSS into amgx / amgxsh.
+    add_subdirectory(external/cudss)
+endif()
 
 if(MPI_FOUND)
     target_link_libraries(amgx   MPI::MPI_CXX)

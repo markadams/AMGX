@@ -68,6 +68,7 @@ AMGX_ERROR AMG_Config::parseParameterString(const char *str)
         // try to read JSON from string first
         if (parse_json_string(str) != AMGX_OK)
         {
+            fprintf(stderr, "[SA-DBG] parseParameterString: JSON parse FAILED, falling back to legacy parser\n");
             // continue with legacy configuration format otherwise
 #endif
             //copy to a temporary array to avoid destroying the string
@@ -83,6 +84,10 @@ AMGX_ERROR AMG_Config::parseParameterString(const char *str)
             }
 
 #ifdef RAPIDJSON_DEFINED
+        }
+        else
+        {
+            fprintf(stderr, "[SA-DBG] parseParameterString: JSON parse succeeded\n");
         }
 #endif
     }
@@ -573,15 +578,22 @@ void AMG_Config::import_json_object(rapidjson::Value &obj, bool outer)
         //printf("Parsing parameter with name \"%s\" of type %s\n", iter->name.GetString(), json_type_names[iter->value.GetType()]);
         if (iter->value.IsObject())
         {
-            if (!iter->value.HasMember("scope"))
+            bool has_scope = iter->value.HasMember("scope");
+            fprintf(stderr, "[CFG-DBG] Object key='%s' current_scope='%s' has_scope=%d\n",
+                    iter->name.GetString(), current_scope.c_str(), (int)has_scope);
+            if (!has_scope)
             {
                 std::string sub_scope = current_scope + "_sub_" + iter->name.GetString();
+                fprintf(stderr, "[CFG-DBG]   auto-generating scope='%s'\n", sub_scope.c_str());
 
                 rapidjson::Value new_val;
                 new_val.SetString(sub_scope.c_str(), sub_scope.size(), json_parser.GetAllocator());
                 iter->value.AddMember("scope", new_val, json_parser.GetAllocator());
             }
 
+            fprintf(stderr, "[CFG-DBG]   importNamedParameter('%s', '%s', '%s', '%s')\n",
+                    iter->name.GetString(), iter->value["solver"].GetString(),
+                    current_scope.c_str(), iter->value["scope"].GetString());
             importNamedParameter(iter->name.GetString(), std::string(iter->value["solver"].GetString()), current_scope, std::string(iter->value["scope"].GetString()));
             import_json_object(iter->value, false);
         }

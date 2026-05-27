@@ -742,14 +742,17 @@ void Cusparse::bsrmv_internal( const typename TConfig::VecPrec alphaConst,
                                const cudaStream_t &stream)
 {
     typedef typename TConfig::VecPrec ValueType;
-    int rowOff, nrows, nnz;
+    int rowOff, nrows;
     A.getOffsetAndSizeForView(view, &rowOff, &nrows);
-    A.getNnzForView(view, &nnz);
+    // E represents a block-diagonal matrix with exactly one block per row.
+    // nnzb must equal nrows (not the full matrix NNZ), otherwise cuSPARSE
+    // reads out-of-bounds from m_seq_offsets (bsrColInd) and E (bsrVal).
+    const int nnzb_diag = nrows;
 
     cusparseDirection_t direction = A.getBlockFormat() == ROW_MAJOR ? CUSPARSE_DIRECTION_ROW : CUSPARSE_DIRECTION_COLUMN;
 
     bsrmv( Cusparse::get_instance().m_handle, direction, CUSPARSE_OPERATION_NON_TRANSPOSE,
-           nrows, A.get_num_cols(), nnz, &alphaConst,
+           nrows, A.get_num_cols(), nnzb_diag, &alphaConst,
            A.cuMatDescr,
            E.raw(),
            A.m_seq_offsets.raw(),
@@ -964,8 +967,11 @@ void Cusparse::bsrmv_internal( const int color,
 
     cusparseCheckError(cusparseSetStream(Cusparse::get_instance().m_handle, stream));
 
+    // E represents a block-diagonal matrix with exactly one block per row.
+    // nnzb must equal A.get_num_rows() (not the full matrix NNZ), otherwise
+    // cuSPARSE reads out-of-bounds from m_seq_offsets (bsrColInd) and E (bsrVal).
     bsrxmv_internal( Cusparse::get_instance().m_handle, direction, CUSPARSE_OPERATION_NON_TRANSPOSE, colorNum,
-                     A.get_num_rows(), A.get_num_cols(), A.get_num_nz(), &alphaConst,
+                     A.get_num_rows(), A.get_num_cols(), A.get_num_rows(), &alphaConst,
                      A.cuMatDescr,
                      E.raw(),
                      A.getMatrixColoring().getSortedRowsByColor().raw() + colorStart,

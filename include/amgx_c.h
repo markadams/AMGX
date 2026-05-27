@@ -604,6 +604,49 @@ AMGX_RC AMGX_API AMGX_solver_resetup
 (AMGX_solver_handle slv,
  AMGX_matrix_handle mtx);
 
+/*
+ * AMGX_solver_set_near_null_space
+ *
+ * Provide near-null space vectors for Smoothed Aggregation AMG.
+ * Must be called after AMGX_solver_create() and before AMGX_solver_setup().
+ *
+ * Parameters:
+ *   slv      - solver handle
+ *   null_dim - number of near-null space vectors (e.g. 1 for scalar PDEs,
+ *              3 for 2D elasticity, 6 for 3D elasticity)
+ *   num_rows - number of rows in the fine-level matrix (number of DOFs)
+ *   data     - host pointer to near-null space data, column-major layout:
+ *              null vector k occupies data[k*num_rows .. (k+1)*num_rows - 1]
+ *              (double precision regardless of solver precision)
+ */
+AMGX_RC AMGX_API AMGX_solver_set_near_null_space
+(AMGX_solver_handle slv,
+ int null_dim,
+ int num_rows,
+ const double *data);
+
+/* AMGX_solver_set_coordinates
+ *
+ * Convenience API: provide node coordinates so that AmgX can automatically
+ * compute the rigid body mode near-null space vectors for elasticity problems.
+ * Internally calls computeRigidBodyModes() and then setNearNullSpace().
+ *
+ * Parameters:
+ *   slv       - solver handle
+ *   dim       - spatial dimension (1, 2, or 3); must equal the matrix block size
+ *   num_nodes - number of mesh nodes (num_rows / dim)
+ *   coords    - host array of node coordinates, length num_nodes * dim,
+ *               interleaved: [x0,y0,z0, x1,y1,z1, ...]
+ *               (double precision)
+ *
+ * Produces null_dim = 1 (scalar), 3 (2D), or 6 (3D) near-null vectors.
+ */
+AMGX_RC AMGX_API AMGX_solver_set_coordinates
+(AMGX_solver_handle slv,
+ int dim,
+ int num_nodes,
+ const double *coords);
+
 #if defined(__cplusplus)
 }//extern "C"
 #endif

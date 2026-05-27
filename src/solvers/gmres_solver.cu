@@ -85,7 +85,22 @@ GMRES_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
         FatalError( "GMRES solver only works on block matrix if configuration parameter use_scalar_norm=1", AMGX_ERR_NOT_SUPPORTED_TARGET );
     }
 
-    if (!no_preconditioner) { m_preconditioner->setup( *this->m_A, reuse_matrix_structure ); }
+    if (!no_preconditioner)
+    {
+        // Forward near-null space to the preconditioner before setup so that
+        // an SA-AMG preconditioner can build a smoothed prolongator.
+        // Without this, m_null_dim stays 0 in the aggregation AMG level,
+        // the SA path is skipped, and AMG collapses to 1 level.
+        fprintf(stderr, "[SA-DBG] GMRES::solver_setup: m_near_null_space_data.size()=%zu, m_near_null_dim=%d, m_near_null_rows=%d\n",
+                m_near_null_space_data.size(), m_near_null_dim, m_near_null_rows);
+        if (!m_near_null_space_data.empty())
+        {
+            fprintf(stderr, "[SA-DBG] GMRES::solver_setup: forwarding near-null space to preconditioner\n");
+            m_preconditioner->setNearNullSpace(m_near_null_dim, m_near_null_rows,
+                                               m_near_null_space_data);
+        }
+        m_preconditioner->setup( *this->m_A, reuse_matrix_structure );
+    }
 
     // Make sure vectors already have decent sizes.
     assert( m_V_vectors.size() >= m_krylov_size + 1 );

@@ -202,6 +202,12 @@ AMGX_ERROR AMG_Solver<T_Config>::setup( Matrix<T_Config> &A)//&A0)
         cudaCheckError();
     }
 
+    // Pass near-null space to the solver (forwarded to AMG if it's an AMG solver)
+    if (hasNearNullSpace())
+    {
+        solver->setNearNullSpace(m_null_dim, m_null_rows, m_near_null_space);
+    }
+
     // postpone free syncs, use device pool
     memory::setAsyncFreeFlag(true);
     AMGX_ERROR e = solver->setup_no_throw(A, reuse_fine_matrix);

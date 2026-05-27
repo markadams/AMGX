@@ -17,6 +17,28 @@
 #include <distributed/glue.h>
 
 #include <amgx_types/util.h>
+#include <vector>
+#include <cstdio>
+#include <cmath>
+
+// Helper: compute L2 norm of a device vector (copies to host)
+template <typename VVector>
+static double vcycle_vec_norm(VVector &v)
+{
+    typedef typename VVector::value_type VT;
+    typedef typename amgx::types::PODTypes<VT>::type PodT;
+    int n = v.size();
+    if (n <= 0) return 0.0;
+    std::vector<VT> h(n);
+    cudaMemcpy(h.data(), v.raw(), n * sizeof(VT), cudaMemcpyDeviceToHost);
+    double norm = 0.0;
+    for (int i = 0; i < n; i++) {
+        double a = (double)static_cast<PodT>(amgx::types::util<VT>::abs(h[i]));
+        norm += a * a;
+    }
+    return std::sqrt(norm);
+}
+
 
 namespace amgx
 {
@@ -27,6 +49,7 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
     AMGX_CPU_COND_MARKER(level->isFinest(), "CYCLE", "Start new cycle");
     typedef typename VVector::value_type ValueType;
     typedef typename TConfig::MemSpace MemorySpace;
+    typedef typename types::PODTypes<ValueType>::type PodType;
     Matrix<T_Config> &A = level->getA();
     Solver<T_Config> *smoother = level->getSmoother();
     VVector &bc = level->getbc();
@@ -59,6 +82,13 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
     else
     {
         //Pre smooth
+        // [VCYCLE-TRACE] Print norms before pre-smooth
+        {
+            double nb = vcycle_vec_norm(b);
+            double nx = vcycle_vec_norm(x);
+            fprintf(stderr, "[VCYCLE-TRACE] level %d: BEFORE pre-smooth: ||b||=%.15e ||x||=%.15e  N=%d\n",
+                    levelnum, nb, nx, (int)A.get_num_rows());
+        }
         level->Profile.tic("Smoother");
         bool xIsZero = false;
 
@@ -109,10 +139,29 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
         }
         level->Profile.toc("Smoother");
 
+        // [VCYCLE-TRACE] Print norms after pre-smooth
+        {
+            double nx = vcycle_vec_norm(x);
+            fprintf(stderr, "[VCYCLE-TRACE] level %d: AFTER pre-smooth: ||x||=%.15e\n",
+                    levelnum, nx);
+        }
+
         if ( level->isCoarsest() && amg->getCoarseSolver(MemorySpace()) != NULL)
             // Only one level with coarse solver
         {
+            // [VCYCLE-TRACE] Coarse solve entry
+            {
+                double nb = vcycle_vec_norm(b);
+                fprintf(stderr, "[VCYCLE-TRACE] level %d: COARSE SOLVE entry: ||b_coarse||=%.15e\n",
+                        levelnum, nb);
+            }
             level->launchCoarseSolver( amg, b, x );
+            // [VCYCLE-TRACE] Coarse solve exit
+            {
+                double nx = vcycle_vec_norm(x);
+                fprintf(stderr, "[VCYCLE-TRACE] level %d: COARSE SOLVE exit:  ||x_coarse||=%.15e\n",
+                        levelnum, nx);
+            }
         }
         else if (level->isCoarsest()) // Now at coarsest level, performed coarsest_sweeps so return
         {
@@ -128,6 +177,14 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
             level->Profile.tic("ComputeResidual");
             axmb(A, x, b, r, offset, size);
             level->Profile.toc("ComputeResidual");
+
+            // [VCYCLE-TRACE] Print residual norm after computing r = b - Ax
+            {
+                double nr = vcycle_vec_norm(r);
+                fprintf(stderr, "[VCYCLE-TRACE] level %d: residual ||r|| = ||b-Ax|| = %.15e\n",
+                        levelnum, nr);
+            }
+
             //apply restriction
             // in classical the current level is consolidated while in aggregation this is the next one.
             // Hence, in classical, given a level L, if we want to consolidate L+1 vectors (ie coarse vectors of L) we have to look at L+1 flags.
@@ -148,6 +205,39 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
             level->Profile.tic("restrictRes");
             level->restrictResidual(r, bc);
             level->Profile.toc("restrictRes");
+
+            // [VCYCLE-TRACE] Print restricted residual norm
+            {
+                double nbc = vcycle_vec_norm(bc);
+                fprintf(stderr, "[VCYCLE-TRACE] level %d: AFTER restrict: ||bc|| (coarse RHS) = %.15e\n",
+                        levelnum, nbc);
+            }
+
+            // After restriction, bc and xc must match the next level's matrix block dims.
+            // For SA with block-compressed Ac (createBlockGraph), the next level's matrix
+            // has block_dimy = null_dim while the restriction P^T produces scalar output.
+            // The smoother check is: b.get_block_size() != m_A->get_block_dimy()
+            // where get_block_size() = block_dimx * block_dimy.
+            // So we need block_dimx=1, block_dimy=next_bdimy, num_rows=bc.size()/next_bdimy.
+            if (level->getNextLevel(MemorySpace()) != nullptr)
+            {
+                int next_bdimy = level->getNextLevel(MemorySpace())->getA().get_block_dimy();
+                int bc_size = (int)bc.size();
+                int next_num_rows = (next_bdimy > 1 && bc_size % next_bdimy == 0)
+                                    ? bc_size / next_bdimy : bc_size;
+                bc.set_block_dimx(1);
+                bc.set_block_dimy(next_bdimy);
+                bc.set_num_rows(next_num_rows);
+                xc.set_block_dimx(1);
+                xc.set_block_dimy(next_bdimy);
+                xc.set_num_rows(next_num_rows);
+            }
+            else
+            {
+                xc.set_block_dimx(bc.get_block_dimx());
+                xc.set_block_dimy(bc.get_block_dimy());
+                xc.set_num_rows(bc.get_num_rows());
+            }
 
             // we have to be very carreful with !A.is_matrix_singleGPU() by A.is_matrix_distributed().
             // In classical consolidation we want to use A.is_matrix_distributed() in order to consolidateVector / unconsolidateVector
@@ -185,9 +275,32 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
                 level->unconsolidateVector(xc);
             }
 
+            // Restore xc/bc to scalar block dims before prolongation.
+            // prolongateAndApplyCorrection calls multiply(m_P_tent, xc, ...) where
+            // m_P_tent is scalar (block_dimx=1). If xc was set to block_dimy=next_bdimy
+            // for the coarse smoother, we must revert it here so the multiply check passes.
+            // The raw data layout is unchanged — only the metadata is adjusted.
+            {
+                int xc_scalar_size = (int)xc.size();
+                xc.set_block_dimx(1);
+                xc.set_block_dimy(1);
+                xc.set_num_rows(xc_scalar_size);
+                bc.set_block_dimx(1);
+                bc.set_block_dimy(1);
+                bc.set_num_rows((int)bc.size());
+            }
+
             //prolongate correction
             level->prolongateAndApplyCorrection(xc, bc, x, r);
             level->Profile.toc("proCorr");
+
+            // [VCYCLE-TRACE] Print norms after prolongation+correction
+            {
+                double nx = vcycle_vec_norm(x);
+                fprintf(stderr, "[VCYCLE-TRACE] level %d: AFTER prolongate+correct: ||x||=%.15e\n",
+                        levelnum, nx);
+            }
+
             //post smooth
             *smoothing_direction = 1;
             level->Profile.tic("Smoother");
@@ -222,6 +335,13 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
                 }
             }
             level->Profile.toc("Smoother");
+
+            // [VCYCLE-TRACE] Print norms after post-smooth
+            {
+                double nx = vcycle_vec_norm(x);
+                fprintf(stderr, "[VCYCLE-TRACE] level %d: AFTER post-smooth: ||x||=%.15e\n",
+                        levelnum, nx);
+            }
 
             if ( (!A.is_matrix_singleGPU()) && (!level->isClassicalAMGLevel()) && consolidation_flag )
             {

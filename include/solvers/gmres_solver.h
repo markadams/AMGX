@@ -34,6 +34,16 @@ class GMRES_Solver : public Solver<T_Config>
         // Preconditioner
         Solver<T_Config> *m_preconditioner;
 
+        // Near-null space storage for SA preconditioner propagation.
+        // When AMG is used as a preconditioner inside GMRES, the near-null
+        // space set via setNearNullSpace() must be forwarded to the
+        // preconditioner before setup() is called.  Without this, m_null_dim
+        // stays 0 in the aggregation AMG level, the SA path is skipped, and
+        // AMG collapses to 1 level.
+        std::vector<double> m_near_null_space_data;
+        int m_near_null_dim  = 0;
+        int m_near_null_rows = 0;
+
         //allocate workspace
         std::vector<VVector> m_V_vectors;
         VVector m_Z_vector;
@@ -57,6 +67,18 @@ class GMRES_Solver : public Solver<T_Config>
         void printSolverParameters() const;
         // Setup the solver
         void solver_setup(bool reuse_matrix_structure);
+
+        // Forward near-null space to the AMG preconditioner (if any).
+        // Called by AMG_Solver::setup() before solver_setup().
+        void setNearNullSpace(int null_dim, int num_rows, const std::vector<double> &data) override
+        {
+            m_near_null_dim  = null_dim;
+            m_near_null_rows = num_rows;
+            m_near_null_space_data = data;
+            // Also forward immediately if preconditioner already exists
+            if (m_preconditioner != nullptr && !data.empty())
+                m_preconditioner->setNearNullSpace(null_dim, num_rows, data);
+        }
 
         bool isColoringNeeded( ) const { if (m_preconditioner != NULL) return m_preconditioner->isColoringNeeded(); else return false; }
 

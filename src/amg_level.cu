@@ -133,7 +133,19 @@ template <class T_Config>
 void AMG_Level<T_Config>::launchCoarseSolver( AMG_Class *amg, VVector &b, VVector &x)
 {
     typedef typename TConfig::MemSpace MemorySpace;
+    typedef typename TConfig::VecPrec VecPrec;
     Solver<TConfig> *coarseSolver = amg->getCoarseSolver( MemorySpace( ) );
+
+    // Diagnostic: print coarse solver info and vector/matrix block dims
+    fprintf(stderr, "[COARSE-SOLVE] b.size=%d  b.block_dimy=%d  b.num_rows=%d  "
+            "x.size=%d  x.block_dimy=%d  x.num_rows=%d  "
+            "A.num_rows=%d  A.block_dimy=%d  A.nnz=%d  "
+            "scope=%s\n",
+            (int)b.size(), (int)b.get_block_dimy(), (int)b.get_num_rows(),
+            (int)x.size(), (int)x.get_block_dimy(), (int)x.get_num_rows(),
+            (int)this->getA().get_num_rows(),
+            (int)this->getA().get_block_dimy(), (int)this->getA().get_num_nz(),
+            coarseSolver->getScope().c_str());
 
     if (this->isInitCycle())
     {
@@ -143,6 +155,9 @@ void AMG_Level<T_Config>::launchCoarseSolver( AMG_Class *amg, VVector &b, VVecto
     {
         coarseSolver->solve( b, x, false);
     }
+
+    fprintf(stderr, "[COARSE-SOLVE] after solve: iters=%d  x.size=%d\n",
+            coarseSolver->get_num_iters(), (int)x.size());
 }
 
 

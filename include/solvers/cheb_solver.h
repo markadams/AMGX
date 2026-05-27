@@ -26,18 +26,23 @@ class Chebyshev_Solver : public Solver<T_Config>
         // Temporary vectors needed for the computation.
         VVector m_p, m_Ap, m_z, m_xp, m_rp;
         // The dot product between z and the residual.
-        ValueTypeB m_r_z, m_lmax, m_lmin, m_gamma, m_beta;
+        ValueTypeB m_r_z, m_lmax, m_lmin, m_lmin_denom, m_gamma, m_beta;
         int m_buffer_N, first_iter;
 
         int m_lambda_mode, m_cheby_order;
 
         double m_user_max_lambda, m_user_min_lambda;
 
+        // SA eigenvalue reuse: set externally before solver_setup() when lambda_mode==4
+        bool m_sa_eig_set;
+        double m_sa_lmax;
+
         bool no_preconditioner;
         Solver<T_Config> *m_preconditioner;
         EigenSolver<T_Config> *m_eigsolver;
 
         virtual void compute_eigenmax_estimate( const Matrix<T_Config> &A, ValueTypeB &lambda );
+        virtual void compute_dinva_eigenmax_estimate( const Matrix<T_Config> &A, ValueTypeB &lambda );
 
     public:
         // Constructor.
@@ -50,6 +55,10 @@ class Chebyshev_Solver : public Solver<T_Config>
 
         // Setup the solver
         void solver_setup(bool reuse_matrix_structure);
+
+        // Set the SA-computed rho(D^{-1}A) estimate for lambda_mode==4.
+        // Must be called before solver_setup().
+        void setSAEigenvalue(double rho) { m_sa_lmax = rho; m_sa_eig_set = true; }
 
         bool isColoringNeeded() const { if (m_preconditioner != NULL) return m_preconditioner->isColoringNeeded(); return false; }
 

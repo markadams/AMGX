@@ -41,9 +41,12 @@ class JacobiL1Solver_Base : public Solver<T_Config>
 
         virtual void compute_d_1x1(const Matrix<T_Config> &A) = 0;
         virtual void compute_d_4x4(const Matrix<T_Config> &A) = 0;
+        virtual void compute_d_BxB(const Matrix<T_Config> &A) = 0;
         virtual void smooth_4x4(Matrix<T_Config> &A, VVector &b, VVector &x, ViewType separation_flags) = 0;
         virtual void smooth_1x1(Matrix<T_Config> &A, VVector &b, VVector &x, ViewType separation_flags, bool latency_hiding) = 0;
         virtual void smooth_with_0_initial_guess_1x1(Matrix<T_Config> &A, VVector &b, VVector &x, ViewType separation_flags) = 0;
+        virtual void smooth_BxB(Matrix<T_Config> &A, VVector &b, VVector &x, ViewType separation_flags) = 0;
+        virtual void smooth_with_0_initial_guess_BxB(Matrix<T_Config> &A, VVector &b, VVector &x, ViewType separation_flags) = 0;
 
     public:
         // Constructor.
@@ -89,9 +92,12 @@ class JacobiL1Solver< TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec>
     private:
         void compute_d_1x1(const Matrix_h &A);
         void compute_d_4x4(const Matrix_h &A);
+        void compute_d_BxB(const Matrix_h &A);
         void smooth_4x4(Matrix_h &A, VVector &b, VVector &x, ViewType separation_flags);
         void smooth_1x1(Matrix_h &A, VVector &b, VVector &x, ViewType separation_flags, bool latency_hiding);
         void smooth_with_0_initial_guess_1x1(Matrix_h &A, VVector &b, VVector &x, ViewType separation_flags);
+        void smooth_BxB(Matrix_h &A, VVector &b, VVector &x, ViewType separation_flags);
+        void smooth_with_0_initial_guess_BxB(Matrix_h &A, VVector &b, VVector &x, ViewType separation_flags);
 };
 
 // ----------------------------
@@ -114,9 +120,12 @@ class JacobiL1Solver< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPre
     private:
         void compute_d_1x1(const Matrix_d &A);
         void compute_d_4x4(const Matrix_d &A);
+        void compute_d_BxB(const Matrix_d &A);
         void smooth_4x4(Matrix_d &A, VVector &b, VVector &x, ViewType separation_flags);
         void smooth_1x1(Matrix_d &A, VVector &b, VVector &x, ViewType separation_flags, bool latency_hiding);
         void smooth_with_0_initial_guess_1x1(Matrix_d &A, VVector &b, VVector &x, ViewType separation_flags);
+        void smooth_BxB(Matrix_d &A, VVector &b, VVector &x, ViewType separation_flags);
+        void smooth_with_0_initial_guess_BxB(Matrix_d &A, VVector &b, VVector &x, ViewType separation_flags);
 };
 
 template<class T_Config>

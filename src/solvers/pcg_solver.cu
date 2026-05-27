@@ -46,6 +46,13 @@ PCG_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
 
     if (!no_preconditioner)
     {
+        // Forward near-null space to the preconditioner before setup so that
+        // an SA-AMG preconditioner can build a smoothed prolongator.
+        // Without this, m_null_dim stays 0 in the AMG level, the SA path is
+        // skipped, and the unsmoothed P causes PCG to diverge.
+        if (!m_near_null_space_data.empty())
+            m_preconditioner->setNearNullSpace(m_near_null_dim, m_near_null_rows,
+                                               m_near_null_space_data);
         m_preconditioner->setup(*this->m_A, reuse_matrix_structure);
     }
 

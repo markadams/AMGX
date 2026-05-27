@@ -32,6 +32,7 @@
 #include <error.h>
 
 #include <memory>
+#include <vector>
 
 #include <amgx_types/util.h>
 
@@ -106,6 +107,21 @@ class AMG_Solver
         inline AMG_Config *getConfig() const { return m_cfg; }
         inline void setResources(Resources *resources) { m_resources = resources; }
 
+        // Near-null space for Smoothed Aggregation AMG.
+        // Data layout: column-major, size = num_rows * null_dim
+        // (null vector 0: rows 0..num_rows-1, null vector 1: rows num_rows..2*num_rows-1, ...)
+        void setNearNullSpace(int null_dim, int num_rows, const double *data)
+        {
+            m_null_dim  = null_dim;
+            m_null_rows = num_rows;
+            m_near_null_space.assign(data, data + (size_t)null_dim * num_rows);
+        }
+
+        int getNullDim()  const { return m_null_dim; }
+        int getNullRows() const { return m_null_rows; }
+        const std::vector<double> &getNearNullSpace() const { return m_near_null_space; }
+        bool hasNearNullSpace() const { return !m_near_null_space.empty(); }
+
         int getStructureReuseLevels();
 
     private:
@@ -117,6 +133,11 @@ class AMG_Solver
         bool m_cfg_self;
         Resources *m_resources;
         Solver<T_Config> *solver;
+
+        // Near-null space vectors (host storage, column-major)
+        std::vector<double> m_near_null_space;
+        int m_null_dim  = 0;
+        int m_null_rows = 0;
 
         int ref_count;
 

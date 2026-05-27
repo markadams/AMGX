@@ -1,0 +1,47 @@
+{
+    "config_version": 2,
+    "solver": {
+        "preconditioner": {
+            "print_grid_stats": 1,
+            "algorithm": "AGGREGATION",
+            "solver": "AMG",
+            "smoother": {
+                "solver": "CHEBYSHEV",
+                "chebyshev_polynomial_order": 1,
+                "chebyshev_lambda_estimate_mode": 4,
+                "chebyshev_lmin_denom": 11.0,
+                "preconditioner": {
+                    "solver": "BLOCK_JACOBI",
+                    "relaxation_factor": 1.0
+                },
+                "scope": "cheby",
+                "monitor_residual": 0,
+                "print_solve_stats": 0
+            },
+            "print_solve_stats": 0,
+            "presweeps": 1,
+            "selector": "MIS",
+            "mis_k": 2,
+            "aggressive_levels": 1,
+            "coarse_solver": "CUDSS_SOLVER",
+            "cudss_matrix_type": "SPD",
+            "cudss_reorder": 1,
+            "max_iters": 1,
+            "monitor_residual": 0,
+            "min_coarse_rows": 32,
+            "scope": "amg",
+            "max_levels": 20,
+            "postsweeps": 1,
+            "cycle": "V"
+        },
+        "solver": "PCG",
+        "print_solve_stats": 1,
+        "obtain_timings": 1,
+        "max_iters": 100,
+        "monitor_residual": 1,
+        "convergence": "RELATIVE_INI",
+        "scope": "main",
+        "tolerance": 1e-08,
+        "norm": "L2"
+    }
+}

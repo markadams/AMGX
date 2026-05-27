@@ -31,6 +31,7 @@
 #include <solvers/algebraic_multigrid_solver.h>
 #include <solvers/pcgf_solver.h>
 #include <solvers/cheb_solver.h>
+#include <eigensolvers.h>
 #include <solvers/cg_solver.h>
 #include <solvers/pcg_solver.h>
 #include <solvers/idr_solver.h>
@@ -53,6 +54,16 @@
 #include <solvers/fixcolor_gauss_seidel_solver.h>
 #include <solvers/dummy_solver.h>
 #include <solvers/dense_lu_solver.h>
+// CudssSolverFactory registration:
+//   AMGX_USE_CUDSS=OFF → stub header provides full class definition (error on use)
+//   AMGX_USE_CUDSS=ON  → real impl in external/cudss/cudss_solver.cu
+#ifndef AMGX_USE_CUDSS
+#include <solvers/cudss_solver_stub.h>
+#else
+namespace amgx { namespace cudss_solver {
+    template <class T_Config> class CudssSolverFactory;
+} }
+#endif
 #include <solvers/kaczmarz_solver.h>
 #include <solvers/chebyshev_poly.h>
 
@@ -85,6 +96,7 @@
 #include <aggregation/selectors/multi_pairwise.h>
 #include <aggregation/selectors/geo_selector.h>
 #include <aggregation/selectors/parallel_greedy_selector.h>
+#include <aggregation/selectors/mis_selector.h>
 //#include <aggregation/selectors/serial_greedy.h>
 //#include <aggregation/selectors/adaptive.h>
 
@@ -394,6 +406,11 @@ inline void registerParameters()
     //DENSE_LU_SOLVER
     AMG_Config::registerParameter<int>("dense_lu_num_rows", "the dense LU solver will be triggered if the matrix size <= dense_lu_num_rows", 128);
     AMG_Config::registerParameter<int>("dense_lu_max_rows", "the dense LU solver will not be triggered if the matrix size >= dense_lu_max_rows > 0 (not used by default)", 0);
+    // cuDSS solver parameters
+    AMG_Config::registerParameter<int>("cudss_reorder",
+        "cuDSS reordering algorithm: 0=none, 1=AMD, 2=METIS <1>", 1);
+    AMG_Config::registerParameter<std::string>("cudss_matrix_type",
+        "cuDSS matrix type: SPD or GENERAL <GENERAL>", std::string("GENERAL"));
     //Richardson's iteration - relaxation parameter
     AMG_Config::registerParameter<double>("relaxation_factor", "the relaxation factor used in a solver", 0.9, 0.0, 2.0);
     //Richardson's iteration - ILU
@@ -406,10 +423,15 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("kpz_mu", "the constant mu used in the KPZ polynomial smoother", 4);
     AMG_Config::registerParameter<int>("kpz_order", "the order of the KPZ polynomial smoother", 3);
     //Chebyshev polynomial smoother
-    AMG_Config::registerParameter<int>("chebyshev_polynomial_order", "the order of the KPZ polynomial smoother", 5);
-    AMG_Config::registerParameter<int>("chebyshev_lambda_estimate_mode", "the order of the KPZ polynomial smoother", 0, 0, 2);
+    AMG_Config::registerParameter<int>("chebyshev_polynomial_order", "the order of the Chebyshev polynomial smoother", 5);
+    // lambda_mode: 0=eigensolver(lmin+lmax), 1=eigensolver(lmax only), 2=row-sum(lmax),
+    //              3=user-provided, 4=reuse SA rho(D^{-1}A) estimate
+    AMG_Config::registerParameter<int>("chebyshev_lambda_estimate_mode", "eigenvalue estimate mode for Chebyshev smoother (0-4)", 0, 0, 4);
     AMG_Config::registerParameter<double>("cheby_max_lambda", "User guess at maximum eigenvalue of preconditioned operator", 1.0, 0.0, 1.0e20);
     AMG_Config::registerParameter<double>("cheby_min_lambda", "User guess at minimum eigenvalue of preconditioned operator", 0.125, 0.0, 1.0e20);
+    // lmin = lmax / chebyshev_lmin_denom.  PETSc GAMG uses 10.0 (lmin=0.1*lmax).
+    // For D-dimensional elasticity some references use D^3 (8 for 2D, 27 for 3D).
+    AMG_Config::registerParameter<double>("chebyshev_lmin_denom", "lmin = lmax / chebyshev_lmin_denom for Chebyshev smoother", 10.0, 1.0, 1.0e6);
     //Kaczmarz
     AMG_Config::registerParameter<int>("kaczmarz_coloring_needed", "Enforces MC Kaczmarz (0 for naive single warp implementation)", 1);
     //CF-Jacobi smoother
@@ -456,7 +478,7 @@ inline void registerParameters()
     //Register Selector (SIZE_[2|4|8]) Parameters
     std::vector<std::string> classical_selector_values = getClassicalSelectors(), aggregation_selector_values = getAggregationSelectors(), combined_selectors = classical_selector_values;
     combined_selectors.insert(combined_selectors.end(), aggregation_selector_values.begin(), aggregation_selector_values.end());
-    AMG_Config::registerParameter<std::string>("selector", "the coarse grid selection algorithm (Classical: <PMIS|AGGRESSIVE_PMIS|HMIS|AGGRESSIVE_HMIS|DUMMY>, Aggregation: <SIZE_2|SIZE_4|SIZE_8|MULTI_PAIRWISE>)", "PMIS", combined_selectors);
+    AMG_Config::registerParameter<std::string>("selector", "the coarse grid selection algorithm (Classical: <PMIS|AGGRESSIVE_PMIS|HMIS|AGGRESSIVE_HMIS|DUMMY>, Aggregation: <SIZE_2|SIZE_4|SIZE_8|MULTI_PAIRWISE|MIS>)", "PMIS", combined_selectors);
     AMG_Config::registerParameter<int>("aggressive_levels", "the number of levels to use aggressive coarsening for (Classical only)", 0);
     AMG_Config::registerParameter<std::string>("aggressive_selector", "the aggressive coarse grid selection algorithm, DEFAULT is same as \"selector\" (Classical only) <PMIS|HMIS|DEFAULT>", "DEFAULT", classical_selector_values);
     AMG_Config::registerParameter<std::string>("aggressive_interpolator", "the interpolation algorithm for aggressive coarsening (Classical only) <MULTIPASS>", "MULTIPASS", classical_selector_values);
@@ -466,6 +488,13 @@ inline void registerParameters()
     AMG_Config::registerParameter<double>("max_unassigned_percentage", "the maximum percentage of vertices that are left unaggregated in first phase of matching algorithms <0.05>", 0.05);
     //Register Selector (MULTI_PAIRWISE) Parameters
     AMG_Config::registerParameter<int>("weight_formula", "choose the weight formula. 0: wij=0.5*(|a_ij|+|aji|)/max(|a_ii|,|a_jj|). 1: wij=-0.5(a_ij/a_ii + a_ji/a_jj) <0>", 0);
+    AMG_Config::registerParameter<int>("mis_k", "for selector=MIS: distance parameter k (1=standard MIS, 2=aggressive coarsening, 3=legal but not recommended; 0 is not allowed) <2>", 2);
+    AMG_Config::registerParameter<int>("aggressive_levels", "for selector=MIS: number of levels to use mis_k (0=no aggressive coarsening i.e. MIS-1 everywhere, N=first N levels use mis_k then MIS-1 on rest) <1>", 1);
+    AMG_Config::registerParameter<int>("max_aggregate_size", "for selector=MIS: max aggregate size for quality refinement (0=no limit) <0>", 0);
+    AMG_Config::registerParameter<double>("refine_threshold", "for selector=MIS: weak edge threshold as fraction of max edge weight per row for refinement <0.1>", 0.1, 0.0, 1.0);
+    AMG_Config::registerParameter<int>("mis2_algorithm", "for selector=MIS with mis_k=2: 0=Galerkin loop, 1=implicit square graph <0>", 0);
+    AMG_Config::registerParameter<double>("mis_strength_threshold", "for selector=MIS: edges with weight < threshold*max_row_weight are ignored during MIS selection (like PETSc -pc_gamg_threshold) <0.0>", 0.0, 0.0, 1.0);
+    AMG_Config::registerParameter<int>("mis_verbose", "for selector=MIS: print detailed aggregation diagnostics (0=quiet, 1=verbose) <0>", 0);
     AMG_Config::registerParameter<int>("aggregation_passes", "for selector=MULTI_PAIRWISE: each pass about doubles the size of each aggregate", 3);
     AMG_Config::registerParameter<int>("filter_weights", "for selector=MULTI_PAIRWISE: set to 1 to remove weak edges before building aggregates. <0>", 0);
     AMG_Config::registerParameter<double>("filter_weights_alpha", "for selector=MULTI_PAIRWISE: a weight is considered weak iff w_ij<alpha*sqrt(max{w_ik}*max{w_jl}). alpha has to be in range (0,1) <0.5>", 0.5, 0.0, 1.0);
@@ -621,6 +650,9 @@ struct registerClasses<T_Config, false>
         SolverFactory<T_Config>::registerFactory("KACZMARZ", new KaczmarzSolverFactory<T_Config>); //not exposed
         //Dense LU (performed locally on each partition in distributed setting)
         SolverFactory<T_Config>::registerFactory("DENSE_LU_SOLVER", new dense_lu_solver::DenseLUSolverFactory<T_Config>);
+        // Always register CUDSS_SOLVER: stub (AMGX_USE_CUDSS=OFF) gives a clear
+        // error; real impl (AMGX_USE_CUDSS=ON) provides full functionality.
+        SolverFactory<T_Config>::registerFactory("CUDSS_SOLVER", new cudss_solver::CudssSolverFactory<T_Config>);
         //No Solver
         SolverFactory<T_Config>::registerFactory("NOSOLVER", new Dummy_SolverFactory<T_Config>);
         //Register AMGLevel Types
@@ -639,6 +671,7 @@ struct registerClasses<T_Config, false>
         aggregation::SelectorFactory<T_Config>::registerFactory("SIZE_4", new aggregation::size4_selector::Size4SelectorFactory<T_Config>);
         aggregation::SelectorFactory<T_Config>::registerFactory("SIZE_8", new aggregation::size8_selector::Size8SelectorFactory<T_Config>);
         aggregation::SelectorFactory<T_Config>::registerFactory("MULTI_PAIRWISE", new aggregation::multi_pairwise::MultiPairwiseSelectorFactory<T_Config>);
+        aggregation::SelectorFactory<T_Config>::registerFactory("MIS", new aggregation::mis_selector::MISSelectorFactory<T_Config>);
         aggregation::SelectorFactory<T_Config>::registerFactory("DUMMY", new aggregation::DUMMY_SelectorFactory<T_Config>); //not exposed
         aggregation::SelectorFactory<T_Config>::registerFactory("GEO", new aggregation::GEO_SelectorFactory<T_Config>); //not exposed
         aggregation::SelectorFactory<T_Config>::registerFactory("PARALLEL_GREEDY_SELECTOR", new aggregation::ParallelGreedySelectorFactory<T_Config>); //not exposed
@@ -776,6 +809,7 @@ AMGX_ERROR initialize()
         AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
 #undef AMGX_CASE_LINE
         registerParameters();
+        eigensolvers::initialize();
     }
     catch (amgx_exception e)
     {
@@ -797,6 +831,7 @@ void finalize()
     AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
     AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
 #undef AMGX_CASE_LINE
+    eigensolvers::finalize();
     AMG_Config::unregisterParameters( );
 #ifdef AMGX_WITH_MPI
     int mpi_initialized = 0;
